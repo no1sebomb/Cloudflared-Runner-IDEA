@@ -26,7 +26,7 @@
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow id="Cloudflared Runner"
                     anchor="right"
-                    icon="AllIcons.General.Web"
+                    icon="/icons/cloudflaredToolWindow.svg"
                     factoryClass="com.noisebomb.cloudflared.ui.TunnelToolWindowFactory"/>
     </extensions>
 </idea-plugin>
