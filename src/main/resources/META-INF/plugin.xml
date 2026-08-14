@@ -1,0 +1,32 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>com.noisebomb.cloudflared-runner</id>
+    <name>Cloudflared Runner</name>
+    <vendor>noisebomb</vendor>
+
+    <description><![CDATA[
+        Runs <code>cloudflared</code> quick tunnels and Access clients from a tool window instead of a
+        terminal tab.<br><br>
+        <ul>
+          <li><b>Quick tunnel</b> — <code>cloudflared tunnel --url &lt;target&gt;</code>, with the generated
+              <code>trycloudflare.com</code> hostname shown in the status column.</li>
+          <li><b>Access client</b> — <code>cloudflared access tcp --hostname &lt;host&gt; --url &lt;bind&gt;</code>,
+              showing the local bind address.</li>
+        </ul>
+        Output is streamed into a per-connection console, so login prompts and auth URLs stay visible.
+        Running processes are killed when the project closes.<br><br>
+        Requires <code>cloudflared</code> on <code>PATH</code>. The plugin does no Cloudflare API calls and
+        handles no credentials — <code>cloudflared</code> does its own authentication.<br><br>
+        <em>Not affiliated with Cloudflare, Inc. "Cloudflare" and "cloudflared" are trademarks of
+        Cloudflare, Inc.</em>
+        ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Cloudflared Runner"
+                    anchor="right"
+                    icon="AllIcons.General.Web"
+                    factoryClass="com.noisebomb.cloudflared.ui.TunnelToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
