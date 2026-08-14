@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{kt,kts}]
+# IntelliJ's own Kotlin style: matches what the IDE formats to, so ktlint and the
+# IDE never fight over the same file.
+ktlint_code_style = intellij_idea
+max_line_length = 120
+ij_kotlin_allow_trailing_comma = true
+ij_kotlin_allow_trailing_comma_on_call_site = true
+# Layout rules that just re-wrap hand-formatted signatures and expressions. The
+# remaining rules (imports, indentation, spacing, naming, blank lines) still apply.
+ktlint_standard_class-signature = disabled
+ktlint_standard_function-signature = disabled
+ktlint_standard_multiline-expression-wrapping = disabled
+ktlint_standard_blank-line-between-when-conditions = disabled
+ktlint_standard_trailing-comma-on-declaration-site = disabled
+ktlint_standard_trailing-comma-on-call-site = disabled
+
+[*.{yml,yaml,xml,svg,json}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

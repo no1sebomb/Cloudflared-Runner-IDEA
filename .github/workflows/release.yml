@@ -1,0 +1,44 @@
+name: Release
+
+# Tag a commit (`git tag v1.0.0 && git push --tags`) to build the plugin ZIP and
+# attach it to a GitHub Release. Publishing to the JetBrains Marketplace is not
+# wired up — it needs a PUBLISH_TOKEN secret and `./gradlew publishPlugin`.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+          cache-read-only: true
+
+      - name: Check and build
+        run: ./gradlew check buildPlugin
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            build/distributions/*.zip

@@ -49,10 +49,17 @@ No Cloudflare API calls, no named tunnels, no `config.yml`, no `~/.cloudflared/`
 ## Development
 
 ```bash
-./gradlew test         # unit tests (output parsing, argument vectors)
-./gradlew runIde       # sandbox IDE with the plugin installed
-./gradlew buildPlugin  # distributable zip in build/distributions
+./gradlew check         # ktlint + unit tests (output parsing, argument vectors)
+./gradlew ktlintFormat  # fix formatting violations in place
+./gradlew runIde        # sandbox IDE with the plugin installed
+./gradlew buildPlugin   # distributable zip in build/distributions
+./gradlew verifyPlugin  # IntelliJ Plugin Verifier against recommended IDEs
 ```
+
+CI (`.github/workflows/build.yml`) runs `check` + `verifyPluginProjectConfiguration` and
+builds the plugin on every push and pull request, then runs the Plugin Verifier in a second
+job. Pushing a `v*` tag builds the zip and attaches it to a GitHub Release
+(`.github/workflows/release.yml`); Marketplace publishing is not wired up.
 
 Source layout:
 
