@@ -39,6 +39,49 @@ class CloudflaredOutputTest {
     }
 
     @Test
+    fun `keeps the query string of a login url`() {
+        val line = "Please open the following URL: https://team.cloudflareaccess.com/cdn-cgi/access/cli?aud=abc&t=1."
+        assertEquals(
+            "https://team.cloudflareaccess.com/cdn-cgi/access/cli?aud=abc&t=1",
+            CloudflaredOutput.findLoginUrl(line),
+        )
+        assertNull(CloudflaredOutput.findLoginUrl("INF Start Websocket listener host=localhost:5433"))
+    }
+
+    @Test
+    fun `detects the access listener coming up`() {
+        assertTrue(CloudflaredOutput.hasAccessListener("INF Start Websocket listener host=localhost:5433"))
+        assertFalse(CloudflaredOutput.hasAccessListener("INF Requesting new quick Tunnel"))
+    }
+
+    @Test
+    fun `summarizes known failures`() {
+        val bindFailure = "failed to start forwarder: listen tcp 127.0.0.1:5433: bind: address already in use"
+        assertEquals("Port :5433 is already in use", CloudflaredOutput.summarize(bindFailure, 1))
+        // No port to name: the generic wording still beats a page of Go internals.
+        assertEquals("Local port is already in use", CloudflaredOutput.summarize("bind: address already in use", 1))
+        assertEquals(
+            "cloudflared not found on PATH",
+            CloudflaredOutput.summarize("Cannot run program \"cloudflared\": error=2, No such file or directory", -1),
+        )
+        assertEquals(
+            "Could not reach Cloudflare",
+            CloudflaredOutput.summarize("failed to request quick Tunnel: context deadline exceeded", 1),
+        )
+    }
+
+    @Test
+    fun `falls back to the last stderr line without its log prefix`() {
+        val line = "2026-08-15T10:11:12Z ERR something nobody predicted"
+        assertEquals("something nobody predicted", CloudflaredOutput.summarize(line, 1))
+    }
+
+    @Test
+    fun `falls back to the exit code when the process said nothing`() {
+        assertEquals("Exited with code 7", CloudflaredOutput.summarize("", 7))
+    }
+
+    @Test
     fun `builds the quick tunnel argument vector`() {
         val config = ConnectionConfig(type = ConnectionType.QUICK_TUNNEL, target = "localhost:8080")
         assertEquals(listOf("cloudflared", "tunnel", "--url", "localhost:8080"), config.commandLine("cloudflared"))

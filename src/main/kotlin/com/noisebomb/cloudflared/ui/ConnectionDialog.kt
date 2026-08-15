@@ -9,14 +9,13 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.noisebomb.cloudflared.model.ConnectionConfig
 import com.noisebomb.cloudflared.model.ConnectionType
-import javax.swing.JComboBox
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
 
 /**
- * Add/edit form for one connection. The type picker swaps which fields are shown, since a quick
- * tunnel needs a local target and an access client needs a hostname plus a local bind address.
+ * Add/edit form for one connection. The type is fixed by whichever entry of the "+" menu was used —
+ * the two types share almost no fields, so switching between them mid-form is not worth supporting.
  */
 class ConnectionDialog(
     project: Project,
@@ -24,48 +23,37 @@ class ConnectionDialog(
     isNew: Boolean,
 ) : DialogWrapper(project) {
 
-    private val typeCombo = JComboBox(ConnectionType.entries.toTypedArray())
+    private val type = original.type
     private val nameField = JBTextField(original.name, COLUMNS)
     private val targetField = JBTextField(original.target, COLUMNS)
     private val bindField = JBTextField(original.localBind.ifBlank { "localhost:" }, COLUMNS)
 
-    private val targetLabel = JLabel()
-    private val bindLabel = JLabel("Local bind:")
-    private val hint = JLabel()
+    private val hint = JLabel(
+        when (type) {
+            ConnectionType.QUICK_TUNNEL -> "cloudflared tunnel --url <local service>"
+            ConnectionType.ACCESS_TCP -> "cloudflared access tcp --hostname <hostname> --url <local bind>"
+        },
+    )
 
     /** Filled in on OK. */
     var result: ConnectionConfig = original.copyOf()
         private set
 
     init {
-        title = if (isNew) "Add Connection" else "Edit Connection"
-        typeCombo.selectedItem = original.type
-        typeCombo.addActionListener { updateForType() }
+        title = (if (isNew) "Add " else "Edit ") + type.displayName
         init()
-        updateForType()
-    }
-
-    private fun selectedType(): ConnectionType = typeCombo.selectedItem as ConnectionType
-
-    private fun updateForType() {
-        val quick = selectedType() == ConnectionType.QUICK_TUNNEL
-        targetLabel.text = if (quick) "Local service:" else "Hostname:"
-        hint.text = if (quick) {
-            "cloudflared tunnel --url <local service>"
-        } else {
-            "cloudflared access tcp --hostname <hostname> --url <local bind>"
-        }
-        bindLabel.isVisible = !quick
-        bindField.isVisible = !quick
     }
 
     override fun createCenterPanel(): JComponent {
         hint.foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
-        val form: JPanel = FormBuilder.createFormBuilder()
-            .addLabeledComponent("Type:", typeCombo)
+        val builder = FormBuilder.createFormBuilder()
             .addLabeledComponent("Name:", nameField)
-            .addLabeledComponent(targetLabel, targetField)
-            .addLabeledComponent(bindLabel, bindField)
+            .addLabeledComponent(
+                if (type == ConnectionType.QUICK_TUNNEL) "Local service:" else "Hostname:",
+                targetField,
+            )
+        if (type == ConnectionType.ACCESS_TCP) builder.addLabeledComponent("Local bind:", bindField)
+        val form: JPanel = builder
             .addComponentToRightColumn(hint, UIUtil.LARGE_VGAP)
             .panel
         form.border = JBUI.Borders.empty(8)
@@ -76,10 +64,10 @@ class ConnectionDialog(
 
     override fun doValidate(): ValidationInfo? {
         if (targetField.text.isBlank()) {
-            val what = if (selectedType() == ConnectionType.QUICK_TUNNEL) "local service" else "hostname"
+            val what = if (type == ConnectionType.QUICK_TUNNEL) "local service" else "hostname"
             return ValidationInfo("Enter a $what.", targetField)
         }
-        if (selectedType() == ConnectionType.ACCESS_TCP && bindField.text.isBlank()) {
+        if (type == ConnectionType.ACCESS_TCP && bindField.text.isBlank()) {
             return ValidationInfo("Enter a local bind address.", bindField)
         }
         return null
@@ -87,7 +75,7 @@ class ConnectionDialog(
 
     override fun doOKAction() {
         result = original.copyOf().apply {
-            type = selectedType()
+            type = this@ConnectionDialog.type
             name = nameField.text.trim()
             target = targetField.text.trim()
             localBind = if (type == ConnectionType.ACCESS_TCP) bindField.text.trim() else ""

@@ -4,20 +4,30 @@ import com.intellij.execution.filters.TextConsoleBuilderFactory
 import com.intellij.execution.process.ProcessHandler
 import com.intellij.execution.ui.ConsoleView
 import com.intellij.icons.AllIcons
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.MessageDialogBuilder
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.IconLoader
+import com.intellij.ui.AnimatedIcon
+import com.intellij.ui.ClientProperty
 import com.intellij.ui.ColoredTableCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
+import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
-import com.intellij.ui.ToolbarDecorator
-import com.intellij.ui.components.JBLabel
+import com.intellij.ui.TitledSeparator
+import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.icons.RgbImageFilterSupplier
 import com.intellij.ui.table.TableView
 import com.intellij.util.ui.ColumnInfo
 import com.intellij.util.ui.JBUI
@@ -29,15 +39,22 @@ import com.noisebomb.cloudflared.model.ConnectionType
 import com.noisebomb.cloudflared.service.TunnelService
 import java.awt.BorderLayout
 import java.awt.CardLayout
+import java.awt.Color
+import java.awt.Cursor
+import java.awt.Point
 import java.awt.datatransfer.StringSelection
+import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.image.RGBImageFilter
+import javax.swing.Icon
 import javax.swing.JPanel
 import javax.swing.JTable
 import javax.swing.ListSelectionModel
-import javax.swing.SwingConstants
+import javax.swing.Timer
 
 /**
- * The whole tool window: a table of connections on top, the log of the selected one below.
+ * The whole tool window: a toolbar and table of connections on top, the log of the selected one in a
+ * foldable section below.
  *
  * Registered as a [Disposable] child of the tool window, which is itself disposed with the project,
  * so consoles are released and (via [TunnelService]) processes killed when the project closes.
@@ -46,67 +63,146 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     private val service = TunnelService.getInstance(project)
 
-    private val columns = arrayOf<ColumnInfo<ConnectionConfig, *>>(
-        object : ColumnInfo<ConnectionConfig, String>("Name") {
-            override fun valueOf(item: ConnectionConfig): String = item.displayName()
-        },
-        object : ColumnInfo<ConnectionConfig, String>("Type") {
-            override fun valueOf(item: ConnectionConfig): String = item.type.displayName
-        },
-        StatusColumn(),
-    )
-
+    private val columns = arrayOf<ColumnInfo<ConnectionConfig, *>>(NameColumn(), TypeColumn(), StatusColumn())
     private val tableModel = ListTableModel(columns, service.connections.toMutableList())
     private val table = TableView(tableModel)
 
     private val consoleCards = CardLayout()
     private val consolePanel = JPanel(consoleCards)
     private val consoles = mutableMapOf<String, ConsoleView>()
+    private val selectedIcons = mutableMapOf<Pair<Icon, Color>, Icon>()
+
+    private val logHeader = LogHeader()
+    private val logPanel = JPanel(BorderLayout())
+    private val splitter = OnePixelSplitter(true, LOG_SPLIT_PROPORTION)
+
+    /** Redraws the status column so the uptime counter ticks; only runs while something is up. */
+    private val uptimeTimer = Timer(1000) { table.repaint() }
+
+    private val toolbar: ActionToolbar = ActionManager.getInstance()
+        .createActionToolbar(TOOLBAR_PLACE, buildToolbarGroup(), true)
+        .also { it.targetComponent = table }
+
+    private val tableComponent = JPanel(BorderLayout()).apply {
+        add(toolbar.component, BorderLayout.NORTH)
+        // No border anywhere in here: the tool window already provides the frame, and an extra one
+        // looks nothing like the bundled tool windows.
+        add(JBScrollPane(table).apply { border = JBUI.Borders.empty() }, BorderLayout.CENTER)
+    }
 
     init {
         table.selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
         table.setShowGrid(false)
         table.rowHeight = JBUI.scale(22)
-        table.selectionModel.addListSelectionListener { if (!it.valueIsAdjusting) showConsoleFor(selected()) }
+        table.emptyText.text = "No connections"
+        table.autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
+        table.columnModel.getColumn(NAME_COLUMN).preferredWidth = JBUI.scale(180)
+        table.columnModel.getColumn(TYPE_COLUMN).preferredWidth = JBUI.scale(104)
+        table.columnModel.getColumn(TYPE_COLUMN).maxWidth = JBUI.scale(220)
+
+        table.selectionModel.addListSelectionListener {
+            if (!it.valueIsAdjusting) {
+                showConsoleFor(selected())
+                toolbar.updateActionsAsync()
+            }
+        }
+        // Without this the spinner in the Starting row is painted as a single frozen frame.
+        ClientProperty.put(table, AnimatedIcon.ANIMATION_IN_RENDERER_ALLOWED, true)
+
         object : DoubleClickListener() {
             override fun onDoubleClick(event: MouseEvent): Boolean {
-                val config = selected() ?: return false
-                if (service.isRunning(config)) service.stop(config) else service.start(config)
+                if (selected() == null) return false
+                editConnection()
                 return true
             }
         }.installOn(table)
+        installAuthLinkHandlers()
+        PopupHandler.installRowSelectionTablePopup(table, buildContextMenuGroup(), POPUP_PLACE)
 
         consolePanel.add(placeholder(), EMPTY_CARD)
-
-        val splitter = OnePixelSplitter(true, 0.35f).apply {
-            firstComponent = buildTableComponent()
-            secondComponent = consolePanel
-        }
-        add(splitter, BorderLayout.CENTER)
+        logPanel.add(consolePanel, BorderLayout.CENTER)
+        applyLogLayout()
 
         service.addListener(ServiceListener(), this)
         if (tableModel.rowCount > 0) table.selectionModel.setSelectionInterval(0, 0)
     }
 
-    private fun buildTableComponent(): JPanel = ToolbarDecorator.createDecorator(table)
-        .setAddAction { addConnection() }
-        .setEditAction { editConnection() }
-        .setRemoveAction { removeConnection() }
-        .addExtraAction(StartAction())
-        .addExtraAction(StopAction())
-        .addExtraAction(CopyStatusAction())
-        .createPanel()
-
-    private fun placeholder(): JPanel = JPanel(BorderLayout()).apply {
-        add(JBLabel("Select a connection to see its output.", SwingConstants.CENTER), BorderLayout.CENTER)
+    /**
+     * Makes the whole Status cell of a connection waiting on authorization behave like a link: hand
+     * cursor on hover, opens the SSO page on click.
+     */
+    private fun installAuthLinkHandlers() {
+        table.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (e.clickCount != 1 || e.button != MouseEvent.BUTTON1) return
+                authUrlAt(e.point)?.let { BrowserUtil.browse(it) }
+            }
+        })
+        table.addMouseMotionListener(object : MouseAdapter() {
+            override fun mouseMoved(e: MouseEvent) {
+                val overLink = authUrlAt(e.point) != null
+                table.cursor = Cursor.getPredefinedCursor(
+                    if (overLink) Cursor.HAND_CURSOR else Cursor.DEFAULT_CURSOR,
+                )
+            }
+        })
     }
+
+    private fun authUrlAt(point: Point): String? {
+        val row = table.rowAtPoint(point)
+        val column = table.columnAtPoint(point)
+        if (row < 0 || column < 0 || table.convertColumnIndexToModel(column) != STATUS_COLUMN) return null
+        val state = tableModel.getItem(row)?.let { service.stateOf(it) } ?: return null
+        return state.authUrl.takeIf { it.isNotBlank() && state.status == ConnectionStatus.AWAITING_AUTH }
+    }
+
+    private fun placeholder(): JPanel = JPanel(BorderLayout())
 
     private fun selected(): ConnectionConfig? = table.selectedObject
 
-    // --- actions ---------------------------------------------------------------------------
+    // --- toolbar and context menu ------------------------------------------------------------
 
-    private fun addConnection() {
-        val dialog = ConnectionDialog(project, ConnectionConfig(type = ConnectionType.QUICK_TUNNEL), isNew = true)
+    private fun buildToolbarGroup(): DefaultActionGroup = DefaultActionGroup().apply {
+        add(addGroup())
+        add(RemoveAction("Remove", AllIcons.General.Remove))
+        add(EditAction())
+        addSeparator()
+        add(RunAction())
+        add(StopAction())
+        addSeparator()
+        add(MoveAction(up = true))
+        add(MoveAction(up = false))
+        add(CopyStatusAction())
+    }
+
+    /** The "+" button: one entry per connection type, since their forms have little in common. */
+    private fun addGroup(): DefaultActionGroup = DefaultActionGroup(
+        AddAction(ConnectionType.QUICK_TUNNEL),
+        AddAction(ConnectionType.ACCESS_TCP),
+    ).apply {
+        templatePresentation.text = "Add"
+        templatePresentation.description = "Add a connection"
+        templatePresentation.icon = AllIcons.General.Add
+        isPopup = true
+    }
+
+    private fun buildContextMenuGroup(): DefaultActionGroup = DefaultActionGroup().apply {
+        add(RunAction())
+        add(StopAction())
+        addSeparator()
+        add(OpenPublicUrlAction())
+        add(CopyAddressAction(isPublic = true))
+        add(CopyAddressAction(isPublic = false))
+        addSeparator()
+        add(EditAction())
+        add(DuplicateAction())
+        add(RemoveAction("Delete", AllIcons.General.Delete))
+    }
+
+    // --- actions -----------------------------------------------------------------------------
+
+    private fun addConnection(type: ConnectionType) {
+        val dialog = ConnectionDialog(project, ConnectionConfig(type = type), isNew = true)
         if (!dialog.showAndGet()) return
         val added = service.addConnection(dialog.result)
         refreshRows()
@@ -121,26 +217,107 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         }
         val dialog = ConnectionDialog(project, config, isNew = false)
         if (!dialog.showAndGet()) return
-        val index = service.connections.indexOfFirst { it.id == config.id }
+        val index = service.indexOf(config)
         if (index >= 0) service.updateConnection(index, dialog.result)
+    }
+
+    private fun duplicateConnection() {
+        val config = selected() ?: return
+        val copy = config.copyOf().apply {
+            id = ""
+            name = config.name.takeIf { it.isNotBlank() }?.let { "$it (copy)" }.orEmpty()
+        }
+        val added = service.addConnection(copy, service.indexOf(config) + 1)
+        refreshRows()
+        selectById(added.id)
     }
 
     private fun removeConnection() {
         val config = selected() ?: return
+        val confirmed = MessageDialogBuilder
+            .yesNo("Remove Connection", "Are you sure you want to remove '${config.displayName()}' connection?")
+            .yesText("Remove")
+            .noText("Cancel")
+            .ask(project)
+        if (!confirmed) return
         service.removeConnection(config)
-        consoles.remove(config.id)?.let { Disposer.dispose(it) }
+        consoles.remove(config.id)?.let {
+            consolePanel.remove(it.component)
+            Disposer.dispose(it)
+        }
     }
 
-    private inner class StartAction : DumbAwareAction("Start", "Start this connection", AllIcons.Actions.Execute) {
+    private fun move(up: Boolean) {
+        val config = selected() ?: return
+        val from = service.indexOf(config)
+        service.moveConnection(from, if (up) from - 1 else from + 1)
+        selectById(config.id)
+    }
+
+    /** For a quick tunnel the public address only exists once cloudflared has granted a hostname. */
+    private fun publicAddress(config: ConnectionConfig): String = when (config.type) {
+        ConnectionType.QUICK_TUNNEL -> service.stateOf(config).publicUrl
+        ConnectionType.ACCESS_TCP -> config.target
+    }
+
+    private fun copyToClipboard(text: String) {
+        if (text.isNotBlank()) CopyPasteManager.getInstance().setContents(StringSelection(text))
+    }
+
+    private inner class AddAction(private val type: ConnectionType) :
+        DumbAwareAction(type.displayName, "Add a ${type.displayName.lowercase()}", CloudflaredIcons.of(type)) {
+        override fun actionPerformed(e: AnActionEvent) = addConnection(type)
+    }
+
+    private inner class RemoveAction(text: String, icon: Icon) :
+        DumbAwareAction(text, "Remove this connection", icon) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = selected() != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = removeConnection()
+    }
+
+    private inner class EditAction : DumbAwareAction("Edit", "Edit this connection", AllIcons.Actions.Edit) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = selected() != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = editConnection()
+    }
+
+    private inner class DuplicateAction : DumbAwareAction("Duplicate", "Copy this connection", AllIcons.Actions.Copy) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = selected() != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = duplicateConnection()
+    }
+
+    /** Never dead: restarts whatever is already up. */
+    private inner class RunAction : DumbAwareAction("Run", "Start this connection", AllIcons.Actions.Execute) {
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
 
         override fun update(e: AnActionEvent) {
             val config = selected()
-            e.presentation.isEnabled = config != null && !service.isRunning(config)
+            e.presentation.isEnabled = config != null
+            if (config != null && service.isRunning(config)) {
+                e.presentation.text = "Restart"
+                e.presentation.icon = AllIcons.Actions.Restart
+            } else {
+                e.presentation.text = "Run"
+                e.presentation.icon = AllIcons.Actions.Execute
+            }
         }
 
         override fun actionPerformed(e: AnActionEvent) {
-            selected()?.let { service.start(it) }
+            selected()?.let { service.restart(it) }
         }
     }
 
@@ -157,21 +334,160 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         }
     }
 
-    private inner class CopyStatusAction :
-        DumbAwareAction("Copy Status", "Copy the URL or bind address", AllIcons.Actions.Copy) {
+    private inner class MoveAction(private val up: Boolean) : DumbAwareAction(
+        if (up) "Move Up" else "Move Down",
+        if (up) "Move this connection up" else "Move this connection down",
+        if (up) AllIcons.Actions.MoveUp else AllIcons.Actions.MoveDown,
+    ) {
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
 
         override fun update(e: AnActionEvent) {
-            e.presentation.isEnabled = selected()?.let { service.stateOf(it).detail.isNotBlank() } == true
+            val index = selected()?.let { service.indexOf(it) } ?: -1
+            e.presentation.isEnabled =
+                if (up) index > 0 else index in 0 until service.connections.size - 1
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = move(up)
+    }
+
+    /**
+     * Only a quick tunnel has a public address you can open: an Access hostname is a bare host that
+     * a browser cannot do anything useful with. The entry stays in the menu, disabled, so both
+     * connection types show the same list.
+     */
+    private inner class OpenPublicUrlAction :
+        DumbAwareAction("Open Public URL", "Open the tunnel in a browser", AllIcons.General.Web) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        private fun url(): String = selected()
+            ?.let { publicAddress(it) }
+            ?.takeIf { it.startsWith("http") }
+            .orEmpty()
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = url().isNotBlank()
         }
 
         override fun actionPerformed(e: AnActionEvent) {
-            val config = selected() ?: return
-            CopyPasteManager.getInstance().setContents(StringSelection(service.stateOf(config).detail))
+            url().takeIf { it.isNotBlank() }?.let { BrowserUtil.browse(it) }
         }
     }
 
-    // --- console ---------------------------------------------------------------------------
+    private inner class CopyAddressAction(private val isPublic: Boolean) : DumbAwareAction(
+        if (isPublic) "Copy Public URL" else "Copy Local URL",
+        if (isPublic) "Copy the address the tunnel is reachable at" else "Copy the address on this machine",
+        AllIcons.Actions.Copy,
+    ) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        private fun address(): String = selected()
+            ?.let { if (isPublic) publicAddress(it) else it.localAddress() }
+            .orEmpty()
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = address().isNotBlank()
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = copyToClipboard(address())
+    }
+
+    private inner class CopyStatusAction : DumbAwareAction(
+        "Copy Address",
+        "Copy the public URL, or the local one until there is a public one",
+        AllIcons.Actions.Copy,
+    ) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        private fun address(): String = selected()
+            ?.let { publicAddress(it).ifBlank { it.localAddress() } }
+            .orEmpty()
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = address().isNotBlank()
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = copyToClipboard(address())
+    }
+
+    private inner class ClearLogAction :
+        DumbAwareAction("Clear Log", "Clear the log of the selected connection", AllIcons.Actions.GC) {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = selected()?.let { consoles.containsKey(it.id) } == true
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            selected()?.let { consoles[it.id]?.clear() }
+        }
+    }
+
+    // --- log section -------------------------------------------------------------------------
+
+    /**
+     * The platform's collapsible group header lives in an `impl` package, so this rebuilds it: a
+     * titled separator whose label doubles as the fold toggle, with its own actions on the right.
+     */
+    private inner class LogHeader : JPanel(BorderLayout()) {
+        private val separator = TitledSeparator("Log")
+
+        init {
+            border = JBUI.Borders.empty(2, 6, 2, 4)
+            isOpaque = false
+            separator.border = JBUI.Borders.empty()
+            separator.isOpaque = false
+            separator.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            separator.label.iconTextGap = JBUI.scale(4)
+            val toggle = object : MouseAdapter() {
+                override fun mousePressed(e: MouseEvent) = toggleLog()
+            }
+            separator.addMouseListener(toggle)
+            separator.label.addMouseListener(toggle)
+
+            val actions = ActionManager.getInstance()
+                .createActionToolbar(LOG_TOOLBAR_PLACE, DefaultActionGroup(ClearLogAction()), true)
+            actions.targetComponent = table
+            actions.component.isOpaque = false
+
+            add(separator, BorderLayout.CENTER)
+            add(actions.component, BorderLayout.EAST)
+            refreshIcon()
+        }
+
+        fun refreshIcon() {
+            separator.label.icon =
+                if (service.logExpanded) AllIcons.General.ArrowDown else AllIcons.General.ArrowRight
+        }
+    }
+
+    private fun toggleLog() {
+        service.logExpanded = !service.logExpanded
+        logHeader.refreshIcon()
+        applyLogLayout()
+    }
+
+    /**
+     * Collapsing has to take the log out of the splitter entirely — leaving it in would keep the
+     * divider draggable over an invisible component.
+     */
+    private fun applyLogLayout() {
+        removeAll()
+        // Splitter.setFirstComponent short-circuits when the component is unchanged, so re-expanding
+        // would leave the table parented to this panel and the splitter empty. Clear it first.
+        splitter.firstComponent = null
+        splitter.secondComponent = null
+        if (service.logExpanded) {
+            logPanel.add(logHeader, BorderLayout.NORTH)
+            splitter.firstComponent = tableComponent
+            splitter.secondComponent = logPanel
+            add(splitter, BorderLayout.CENTER)
+        } else {
+            add(tableComponent, BorderLayout.CENTER)
+            add(logHeader, BorderLayout.SOUTH)
+        }
+        revalidate()
+        repaint()
+    }
 
     private fun consoleFor(config: ConnectionConfig): ConsoleView = consoles.getOrPut(config.id) {
         val console = TextConsoleBuilderFactory.getInstance().createBuilder(project).console
@@ -189,6 +505,8 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         }
     }
 
+    // --- table plumbing ----------------------------------------------------------------------
+
     private fun selectById(id: String) {
         val row = tableModel.items.indexOfFirst { it.id == id }
         if (row >= 0) table.selectionModel.setSelectionInterval(row, row)
@@ -199,6 +517,49 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         tableModel.items = service.connections.toMutableList()
         if (previous != null) selectById(previous)
         showConsoleFor(selected())
+        toolbar.updateActionsAsync()
+    }
+
+    /**
+     * Single-colour icons keep their own colour on a selected row, where it all but disappears
+     * against the selection background. Repaint them in the row's foreground colour instead —
+     * cached, because the uptime counter repaints the table every second.
+     *
+     * [IconUtil.colorize] is the obvious call and the wrong one: it *multiplies* the source
+     * brightness by the target's, so recolouring a mid-grey icon white leaves it mid-grey.
+     */
+    private fun rowIcon(base: Icon, isSelected: Boolean, foreground: Color): Icon {
+        if (!isSelected) return base
+        return selectedIcons.getOrPut(base to foreground) {
+            IconLoader.filterIcon(base, RecolorFilter(foreground))
+        }
+    }
+
+    /** Keeps each pixel's alpha — that is the anti-aliasing — and replaces the colour outright. */
+    private class RecolorFilter(private val color: Color) : RgbImageFilterSupplier {
+        override fun getFilter(): RGBImageFilter = object : RGBImageFilter() {
+            private val replacement = color.rgb and RGB_MASK
+
+            init {
+                canFilterIndexColorModel = true
+            }
+
+            override fun filterRGB(x: Int, y: Int, rgb: Int): Int = (rgb and ALPHA_MASK) or replacement
+        }
+
+        private companion object {
+            const val RGB_MASK = 0x00FFFFFF
+            const val ALPHA_MASK = 0xFF000000.toInt()
+        }
+    }
+
+    private fun syncUptimeTimer() {
+        val ticking = service.connections.any { service.stateOf(it).status == ConnectionStatus.RUNNING }
+        if (ticking && !uptimeTimer.isRunning) {
+            uptimeTimer.start()
+        } else if (!ticking && uptimeTimer.isRunning) {
+            uptimeTimer.stop()
+        }
     }
 
     private inner class ServiceListener : TunnelService.Listener {
@@ -207,25 +568,67 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             val console = consoleFor(config)
             console.clear()
             console.attachToProcess(handler)
-            showConsoleFor(config)
         }
 
         override fun stateChanged(config: ConnectionConfig, state: ConnectionState) {
             val row = tableModel.items.indexOfFirst { it.id == config.id }
             if (row >= 0) tableModel.fireTableRowsUpdated(row, row)
+            syncUptimeTimer()
+            toolbar.updateActionsAsync()
         }
 
         override fun connectionsChanged() {
             refreshRows()
+            syncUptimeTimer()
         }
     }
 
     override fun dispose() {
+        uptimeTimer.stop()
         // Consoles are disposed as children of this panel; processes belong to the project service.
         consoles.clear()
     }
 
-    /** Status text plus a colour cue, so a failure is obvious without opening the log. */
+    // --- columns -----------------------------------------------------------------------------
+
+    private inner class NameColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Name") {
+        override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
+
+        override fun getRenderer(item: ConnectionConfig) = object : ColoredTableCellRenderer() {
+            override fun customizeCellRenderer(
+                table: JTable,
+                value: Any?,
+                selected: Boolean,
+                hasFocus: Boolean,
+                row: Int,
+                column: Int,
+            ) {
+                val config = value as? ConnectionConfig ?: return
+                append(config.displayName())
+            }
+        }
+    }
+
+    private inner class TypeColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Type") {
+        override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
+
+        override fun getRenderer(item: ConnectionConfig) = object : ColoredTableCellRenderer() {
+            override fun customizeCellRenderer(
+                table: JTable,
+                value: Any?,
+                selected: Boolean,
+                hasFocus: Boolean,
+                row: Int,
+                column: Int,
+            ) {
+                val config = value as? ConnectionConfig ?: return
+                icon = rowIcon(CloudflaredIcons.of(config.type), selected, foreground)
+                append(config.type.displayName)
+            }
+        }
+    }
+
+    /** Status, uptime and the one useful address, so a failure is obvious without opening the log. */
     private inner class StatusColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Status") {
         override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
 
@@ -240,17 +643,44 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             ) {
                 val config = value as? ConnectionConfig ?: return
                 val state = service.stateOf(config)
+                val statusIcon = CloudflaredIcons.of(state.status)
+                icon = if (CloudflaredIcons.isMonochrome(state.status)) {
+                    rowIcon(statusIcon, selected, foreground)
+                } else {
+                    statusIcon
+                }
+                if (state.status == ConnectionStatus.AWAITING_AUTH && state.authUrl.isNotBlank()) {
+                    // Clicking the cell opens this; see the mouse handlers on the table.
+                    append("${state.status.label} $EXTERNAL_LINK_ARROW", SimpleTextAttributes.LINK_ATTRIBUTES)
+                    return
+                }
                 val attributes = when (state.status) {
                     ConnectionStatus.RUNNING -> SimpleTextAttributes.REGULAR_ATTRIBUTES
+                    ConnectionStatus.AWAITING_AUTH -> SimpleTextAttributes.REGULAR_ATTRIBUTES
                     ConnectionStatus.FAILED -> SimpleTextAttributes.ERROR_ATTRIBUTES
                     else -> SimpleTextAttributes.GRAYED_ATTRIBUTES
                 }
-                append(state.detail.ifBlank { state.status.name.lowercase() }, attributes)
+                append(state.status.label, attributes)
+                state.uptime().takeIf { it.isNotEmpty() }?.let {
+                    append(" $it", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
+                // Addresses used to live here; only the things you cannot get anywhere else remain.
+                if (state.detail.isNotBlank()) {
+                    append("  ${state.detail}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
             }
         }
     }
 
     private companion object {
         const val EMPTY_CARD = "__empty__"
+        const val TOOLBAR_PLACE = "CloudflaredRunnerToolbar"
+        const val LOG_TOOLBAR_PLACE = "CloudflaredRunnerLogToolbar"
+        const val POPUP_PLACE = "CloudflaredRunnerPopup"
+        const val NAME_COLUMN = 0
+        const val TYPE_COLUMN = 1
+        const val STATUS_COLUMN = 2
+        const val EXTERNAL_LINK_ARROW = "\u2197"
+        const val LOG_SPLIT_PROPORTION = 0.72f
     }
 }

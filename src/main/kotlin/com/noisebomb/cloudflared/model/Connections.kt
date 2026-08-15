@@ -2,6 +2,7 @@ package com.noisebomb.cloudflared.model
 
 import com.intellij.util.xmlb.annotations.Attribute
 import com.intellij.util.xmlb.annotations.Tag
+import java.util.Locale
 
 /**
  * The two things this plugin can spawn. Both are plain child processes; they only differ in the
@@ -40,16 +41,51 @@ data class ConnectionConfig(
         }
     }
 
+    /**
+     * The address on this machine. For a quick tunnel that is the service being exposed; for an
+     * access client it is the listener cloudflared opens.
+     */
+    fun localAddress(): String = when (type) {
+        ConnectionType.QUICK_TUNNEL -> target
+        ConnectionType.ACCESS_TCP -> localBind
+    }
+
     fun copyOf(): ConnectionConfig = copy()
 }
 
-enum class ConnectionStatus { STOPPED, STARTING, RUNNING, FAILED }
+enum class ConnectionStatus(val label: String) {
+    STOPPED("Stopped"),
+    STARTING("Starting"),
+    RUNNING("Running"),
+
+    /** cloudflared is waiting for the user to finish the Access SSO round trip. */
+    AWAITING_AUTH("Authorization required"),
+    FAILED("Failed"),
+}
 
 /**
  * Live state for one connection. [detail] is whatever the user actually needs to see: the generated
- * trycloudflare URL, the local bind address, an auth hint, or an error.
+ * trycloudflare URL, the local bind address, an auth hint, or a short error summary.
  */
 data class ConnectionState(
     val status: ConnectionStatus = ConnectionStatus.STOPPED,
     val detail: String = "",
-)
+    /** Only a quick tunnel gets one, and only once cloudflared has printed it. */
+    val publicUrl: String = "",
+    /** The SSO link cloudflared printed while waiting for authorization, if it printed one. */
+    val authUrl: String = "",
+    /** Epoch millis the current [ConnectionStatus.RUNNING] stretch began; 0 when not running. */
+    val runningSince: Long = 0L,
+) {
+    /** `MM:SS`, or `H:MM:SS` past the hour. Empty unless running. */
+    fun uptime(now: Long = System.currentTimeMillis()): String {
+        if (status != ConnectionStatus.RUNNING || runningSince <= 0L) return ""
+        val seconds = ((now - runningSince) / 1000).coerceAtLeast(0)
+        val hours = seconds / 3600
+        return if (hours > 0) {
+            String.format(Locale.ROOT, "%d:%02d:%02d", hours, (seconds % 3600) / 60, seconds % 60)
+        } else {
+            String.format(Locale.ROOT, "%02d:%02d", seconds / 60, seconds % 60)
+        }
+    }
+}
