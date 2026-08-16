@@ -74,6 +74,11 @@ data class ConnectionState(
     val publicUrl: String = "",
     /** The SSO link cloudflared printed while waiting for authorization, if it printed one. */
     val authUrl: String = "",
+    /**
+     * Something wrong that the connection nevertheless survives — a quick tunnel whose local
+     * service is down still serves, it just answers 502. Cleared as soon as the cause goes away.
+     */
+    val warning: String = "",
     /** Epoch millis the current [ConnectionStatus.RUNNING] stretch began; 0 when not running. */
     val runningSince: Long = 0L,
 ) {

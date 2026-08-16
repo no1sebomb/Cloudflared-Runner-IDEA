@@ -9,7 +9,9 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.DumbAwareAction
@@ -21,13 +23,14 @@ import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.AnimatedIcon
 import com.intellij.ui.ClientProperty
 import com.intellij.ui.ColoredTableCellRenderer
-import com.intellij.ui.DoubleClickListener
+import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.TitledSeparator
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.icons.RgbImageFilterSupplier
+import com.intellij.ui.render.RenderingUtil
 import com.intellij.ui.table.TableView
 import com.intellij.util.ui.ColumnInfo
 import com.intellij.util.ui.JBUI
@@ -42,13 +45,17 @@ import java.awt.CardLayout
 import java.awt.Color
 import java.awt.Cursor
 import java.awt.Point
+import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.image.RGBImageFilter
 import javax.swing.Icon
 import javax.swing.JPanel
 import javax.swing.JTable
+import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
 import javax.swing.Timer
 
@@ -79,6 +86,22 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     /** Redraws the status column so the uptime counter ticks; only runs while something is up. */
     private val uptimeTimer = Timer(1000) { table.repaint() }
 
+    /** Which button the previous click used; see [installMouseHandlers]. */
+    private var lastClickButton = MouseEvent.NOBUTTON
+
+    // One instance each, shared between the toolbar and the context menu: a shortcut is registered
+    // on the action object, so a second copy of an action would be a second copy of its shortcut.
+    private val runAction = RunAction()
+    private val stopAction = StopAction()
+    private val editAction = EditAction()
+    private val duplicateAction = DuplicateAction()
+    private val deleteAction = DeleteAction()
+    private val moveUpAction = MoveAction(up = true)
+    private val moveDownAction = MoveAction(up = false)
+    private val openPublicUrlAction = OpenPublicUrlAction()
+    private val copyPublicUrlAction = CopyAddressAction(isPublic = true)
+    private val copyLocalUrlAction = CopyAddressAction(isPublic = false)
+
     private val toolbar: ActionToolbar = ActionManager.getInstance()
         .createActionToolbar(TOOLBAR_PLACE, buildToolbarGroup(), true)
         .also { it.targetComponent = table }
@@ -92,6 +115,12 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     init {
         table.selectionModel.selectionMode = ListSelectionModel.SINGLE_SELECTION
+        // Rows are selectable, cells are not. With column selection left on, a renderer is told the
+        // cell is unselected even on the selected row, so it paints its icon in the unselected
+        // colour against the selection background.
+        table.columnSelectionAllowed = false
+        table.rowSelectionAllowed = true
+        table.intercellSpacing = JBUI.emptySize()
         table.setShowGrid(false)
         table.rowHeight = JBUI.scale(22)
         table.emptyText.text = "No connections"
@@ -109,14 +138,8 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         // Without this the spinner in the Starting row is painted as a single frozen frame.
         ClientProperty.put(table, AnimatedIcon.ANIMATION_IN_RENDERER_ALLOWED, true)
 
-        object : DoubleClickListener() {
-            override fun onDoubleClick(event: MouseEvent): Boolean {
-                if (selected() == null) return false
-                editConnection()
-                return true
-            }
-        }.installOn(table)
-        installAuthLinkHandlers()
+        installMouseHandlers()
+        registerShortcuts()
         PopupHandler.installRowSelectionTablePopup(table, buildContextMenuGroup(), POPUP_PLACE)
 
         consolePanel.add(placeholder(), EMPTY_CARD)
@@ -128,14 +151,31 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     }
 
     /**
-     * Makes the whole Status cell of a connection waiting on authorization behave like a link: hand
-     * cursor on hover, opens the SSO page on click.
+     * A single left click follows an authorization link — the whole Status cell of a connection
+     * waiting on one behaves like a link, hand cursor included. A double click edits.
      */
-    private fun installAuthLinkHandlers() {
+    private fun installMouseHandlers() {
         table.addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) {
+                // Clicking past the last row deselects, the way a file list does. Without this the
+                // row stays lit while nothing about the click had anything to do with it.
+                if (table.rowAtPoint(e.point) < 0) table.clearSelection()
+            }
+
             override fun mouseClicked(e: MouseEvent) {
-                if (e.clickCount != 1 || e.button != MouseEvent.BUTTON1) return
-                authUrlAt(e.point)?.let { BrowserUtil.browse(it) }
+                val previousButton = lastClickButton
+                lastClickButton = e.button
+                if (e.button != MouseEvent.BUTTON1) return
+                if (e.clickCount == 1) {
+                    authUrlAt(e.point)?.let { BrowserUtil.browse(it) }
+                    return
+                }
+                // AWT counts clicks by time and position rather than by button, so the left click
+                // that dismisses a context menu arrives as click two of a double click the right
+                // click began. Only a pair of left clicks is one.
+                if (e.clickCount == 2 && previousButton == MouseEvent.BUTTON1 && selected() != null) {
+                    editConnection()
+                }
             }
         })
         table.addMouseMotionListener(object : MouseAdapter() {
@@ -164,15 +204,14 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     private fun buildToolbarGroup(): DefaultActionGroup = DefaultActionGroup().apply {
         add(addGroup())
-        add(RemoveAction("Remove", AllIcons.General.Remove))
-        add(EditAction())
+        add(deleteAction)
+        add(editAction)
         addSeparator()
-        add(RunAction())
-        add(StopAction())
+        add(runAction)
+        add(stopAction)
         addSeparator()
-        add(MoveAction(up = true))
-        add(MoveAction(up = false))
-        add(CopyStatusAction())
+        add(moveUpAction)
+        add(moveDownAction)
     }
 
     /** The "+" button: one entry per connection type, since their forms have little in common. */
@@ -187,16 +226,50 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     }
 
     private fun buildContextMenuGroup(): DefaultActionGroup = DefaultActionGroup().apply {
-        add(RunAction())
-        add(StopAction())
+        add(runAction)
+        add(stopAction)
         addSeparator()
-        add(OpenPublicUrlAction())
-        add(CopyAddressAction(isPublic = true))
-        add(CopyAddressAction(isPublic = false))
+        add(addressGroup())
         addSeparator()
-        add(EditAction())
-        add(DuplicateAction())
-        add(RemoveAction("Delete", AllIcons.General.Delete))
+        add(editAction)
+        add(duplicateAction)
+        add(deleteAction)
+    }
+
+    /** Three entries that are all "give me the address", folded away from the everyday ones. */
+    private fun addressGroup(): DefaultActionGroup = DefaultActionGroup(
+        openPublicUrlAction,
+        copyPublicUrlAction,
+        copyLocalUrlAction,
+    ).apply {
+        templatePresentation.text = "Addresses"
+        isPopup = true
+    }
+
+    /**
+     * Shortcuts live on the table, so they only fire while it has focus, and are registered on the
+     * shared action instances, which is what puts the hint on toolbar tooltips and menu entries.
+     */
+    private fun registerShortcuts() {
+        val menu = Toolkit.getDefaultToolkit().menuShortcutKeyMaskEx
+        editAction.bind(KeyEvent.VK_ENTER, 0)
+        deleteAction.bind(KeyEvent.VK_DELETE, 0)
+        duplicateAction.bind(KeyEvent.VK_D, menu)
+        runAction.bind(KeyEvent.VK_R, menu)
+        stopAction.bind(KeyEvent.VK_F2, menu)
+        moveUpAction.bind(KeyEvent.VK_UP, menu)
+        moveDownAction.bind(KeyEvent.VK_DOWN, menu)
+        openPublicUrlAction.bind(KeyEvent.VK_B, menu)
+        copyPublicUrlAction.bind(KeyEvent.VK_C, menu)
+        copyLocalUrlAction.bind(KeyEvent.VK_C, menu or InputEvent.SHIFT_DOWN_MASK)
+    }
+
+    private fun AnAction.bind(keyCode: Int, modifiers: Int) {
+        registerCustomShortcutSet(
+            CustomShortcutSet(KeyStroke.getKeyStroke(keyCode, modifiers)),
+            table,
+            this@TunnelPanel,
+        )
     }
 
     // --- actions -----------------------------------------------------------------------------
@@ -269,12 +342,18 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         override fun actionPerformed(e: AnActionEvent) = addConnection(type)
     }
 
-    private inner class RemoveAction(text: String, icon: Icon) :
-        DumbAwareAction(text, "Remove this connection", icon) {
+    /**
+     * The toolbar wants the minus that sits under a list, the menu wants a trash can. Same action
+     * either way — two instances would mean the Delete key firing two of them.
+     */
+    private inner class DeleteAction : DumbAwareAction("Delete", "Remove this connection", AllIcons.General.Delete) {
         override fun getActionUpdateThread() = ActionUpdateThread.EDT
 
         override fun update(e: AnActionEvent) {
             e.presentation.isEnabled = selected() != null
+            val onToolbar = e.place == TOOLBAR_PLACE
+            e.presentation.text = if (onToolbar) "Remove" else "Delete"
+            e.presentation.icon = if (onToolbar) AllIcons.General.Remove else AllIcons.General.Delete
         }
 
         override fun actionPerformed(e: AnActionEvent) = removeConnection()
@@ -382,24 +461,6 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
         private fun address(): String = selected()
             ?.let { if (isPublic) publicAddress(it) else it.localAddress() }
-            .orEmpty()
-
-        override fun update(e: AnActionEvent) {
-            e.presentation.isEnabled = address().isNotBlank()
-        }
-
-        override fun actionPerformed(e: AnActionEvent) = copyToClipboard(address())
-    }
-
-    private inner class CopyStatusAction : DumbAwareAction(
-        "Copy Address",
-        "Copy the public URL, or the local one until there is a public one",
-        AllIcons.Actions.Copy,
-    ) {
-        override fun getActionUpdateThread() = ActionUpdateThread.EDT
-
-        private fun address(): String = selected()
-            ?.let { publicAddress(it).ifBlank { it.localAddress() } }
             .orEmpty()
 
         override fun update(e: AnActionEvent) {
@@ -525,15 +586,23 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
      * against the selection background. Repaint them in the row's foreground colour instead —
      * cached, because the uptime counter repaints the table every second.
      *
-     * [IconUtil.colorize] is the obvious call and the wrong one: it *multiplies* the source
+     * The colour comes from the table rather than from the renderer's own `foreground`, and the
+     * selection from the row rather than the cell, so neither depends on the platform agreeing that
+     * this particular cell is selected.
+     *
+     * `IconUtil.colorize` is the obvious call and the wrong one: it *multiplies* the source
      * brightness by the target's, so recolouring a mid-grey icon white leaves it mid-grey.
      */
-    private fun rowIcon(base: Icon, isSelected: Boolean, foreground: Color): Icon {
-        if (!isSelected) return base
+    private fun rowIcon(base: Icon, table: JTable, row: Int): Icon {
+        if (!isRowSelected(table, row)) return base
+        val foreground = RenderingUtil.getForeground(table, true)
         return selectedIcons.getOrPut(base to foreground) {
             IconLoader.filterIcon(base, RecolorFilter(foreground))
         }
     }
+
+    private fun isRowSelected(table: JTable, row: Int): Boolean = row in 0 until table.rowCount &&
+        table.isRowSelected(row)
 
     /** Keeps each pixel's alpha — that is the anti-aliasing — and replaces the colour outright. */
     private class RecolorFilter(private val color: Color) : RgbImageFilterSupplier {
@@ -591,19 +660,52 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     // --- columns -----------------------------------------------------------------------------
 
-    private inner class NameColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Name") {
+    /**
+     * Everything the three columns need to look like one selected row rather than three cells.
+     *
+     * `setPaintFocusBorder` and the icon background are both decided before `customizeCellRenderer`
+     * runs, which is why the icon flag is set once in the constructor and the focus border is turned
+     * off on every pass.
+     */
+    private abstract class RowRenderer : ColoredTableCellRenderer() {
+        init {
+            // Otherwise the strip behind the icon is filled with the *table's* background, punching
+            // a hole in the selection colour the rest of the cell is painted with.
+            isTransparentIconBackground = true
+        }
+
+        /**
+         * The row is the unit of selection, so the ring the platform draws around the one focused
+         * *cell* is noise — and it outlives the selection colour when the table loses focus, which
+         * leaves an outlined row on an otherwise unhighlighted table.
+         *
+         * Only the border reads `hasFocus`; foreground and background come from `selected` alone,
+         * so lying about it here costs nothing else.
+         */
+        final override fun acquireState(table: JTable, selected: Boolean, hasFocus: Boolean, row: Int, column: Int) {
+            super.acquireState(table, selected, false, row, column)
+        }
+
+        final override fun customizeCellRenderer(
+            table: JTable,
+            value: Any?,
+            selected: Boolean,
+            hasFocus: Boolean,
+            row: Int,
+            column: Int,
+        ) {
+            val config = value as? ConnectionConfig ?: return
+            render(table, config, row)
+        }
+
+        abstract fun render(table: JTable, config: ConnectionConfig, row: Int)
+    }
+
+    private class NameColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Name") {
         override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
 
-        override fun getRenderer(item: ConnectionConfig) = object : ColoredTableCellRenderer() {
-            override fun customizeCellRenderer(
-                table: JTable,
-                value: Any?,
-                selected: Boolean,
-                hasFocus: Boolean,
-                row: Int,
-                column: Int,
-            ) {
-                val config = value as? ConnectionConfig ?: return
+        override fun getRenderer(item: ConnectionConfig) = object : RowRenderer() {
+            override fun render(table: JTable, config: ConnectionConfig, row: Int) {
                 append(config.displayName())
             }
         }
@@ -612,17 +714,9 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     private inner class TypeColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Type") {
         override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
 
-        override fun getRenderer(item: ConnectionConfig) = object : ColoredTableCellRenderer() {
-            override fun customizeCellRenderer(
-                table: JTable,
-                value: Any?,
-                selected: Boolean,
-                hasFocus: Boolean,
-                row: Int,
-                column: Int,
-            ) {
-                val config = value as? ConnectionConfig ?: return
-                icon = rowIcon(CloudflaredIcons.of(config.type), selected, foreground)
+        override fun getRenderer(item: ConnectionConfig) = object : RowRenderer() {
+            override fun render(table: JTable, config: ConnectionConfig, row: Int) {
+                icon = rowIcon(CloudflaredIcons.of(config.type), table, row)
                 append(config.type.displayName)
             }
         }
@@ -632,20 +726,12 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
     private inner class StatusColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Status") {
         override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
 
-        override fun getRenderer(item: ConnectionConfig) = object : ColoredTableCellRenderer() {
-            override fun customizeCellRenderer(
-                table: JTable,
-                value: Any?,
-                selected: Boolean,
-                hasFocus: Boolean,
-                row: Int,
-                column: Int,
-            ) {
-                val config = value as? ConnectionConfig ?: return
+        override fun getRenderer(item: ConnectionConfig) = object : RowRenderer() {
+            override fun render(table: JTable, config: ConnectionConfig, row: Int) {
                 val state = service.stateOf(config)
                 val statusIcon = CloudflaredIcons.of(state.status)
                 icon = if (CloudflaredIcons.isMonochrome(state.status)) {
-                    rowIcon(statusIcon, selected, foreground)
+                    rowIcon(statusIcon, table, row)
                 } else {
                     statusIcon
                 }
@@ -668,6 +754,9 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
                 if (state.detail.isNotBlank()) {
                     append("  ${state.detail}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                 }
+                if (state.warning.isNotBlank()) {
+                    append("  ${state.warning}", WARNING_ATTRIBUTES)
+                }
             }
         }
     }
@@ -682,5 +771,11 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         const val STATUS_COLUMN = 2
         const val EXTERNAL_LINK_ARROW = "\u2197"
         const val LOG_SPLIT_PROPORTION = 0.72f
+
+        /** Amber, not red: whatever it says, the connection is still up. */
+        val WARNING_ATTRIBUTES = SimpleTextAttributes(
+            SimpleTextAttributes.STYLE_PLAIN,
+            JBColor.namedColor("Component.warningForeground", 0x9A6E3A, 0xD9A343),
+        )
     }
 }

@@ -8,6 +8,8 @@ import com.intellij.execution.process.ProcessHandler
 import com.intellij.execution.process.ProcessListener
 import com.intellij.execution.process.ProcessOutputTypes
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationActivationListener
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
@@ -16,7 +18,9 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
+import com.intellij.openapi.wm.IdeFrame
 import com.intellij.util.concurrency.AppExecutorUtil
+import com.intellij.util.io.BaseOutputReader
 import com.intellij.util.xmlb.XmlSerializerUtil
 import com.intellij.util.xmlb.annotations.XCollection
 import com.noisebomb.cloudflared.model.ConnectionConfig
@@ -68,7 +72,34 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
 
     /** Ids whose process we killed on purpose, so its non-zero exit is not reported as a failure. */
     private val stopRequested = ConcurrentHashMap.newKeySet<String>()
+
+    /** Ids whose access listener is still being probed; see [probeAccessListener]. */
+    private val probePending = ConcurrentHashMap.newKeySet<String>()
+
+    /** When cloudflared last asked for authorization, per id. See [recheckAuthorization]. */
+    private val authPromptAt = ConcurrentHashMap<String, Long>()
+
+    /** Window activation fires in bursts; one re-check per burst is plenty. */
+    @Volatile
+    private var lastAuthRecheck = 0L
+
+    /** Same, for the health check that runs while a connection is up. */
+    private val healthWatched = ConcurrentHashMap.newKeySet<String>()
+
+    /** Ids we killed over an error worth keeping on screen; see [failAndStop]. */
+    private val fatalError = ConcurrentHashMap.newKeySet<String>()
     private val listeners = CopyOnWriteArrayList<Listener>()
+
+    init {
+        // Coming back to the IDE is the one reliable sign that a browser login just finished.
+        ApplicationManager.getApplication().messageBus.connect(this)
+            .subscribe(
+                ApplicationActivationListener.TOPIC,
+                object : ApplicationActivationListener {
+                    override fun applicationActivated(ideFrame: IdeFrame) = recheckAuthorization()
+                },
+            )
+    }
 
     override fun getState(): State = state
 
@@ -137,7 +168,7 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
             .withWorkDirectory(project.basePath)
 
         val handler = try {
-            KillableColoredProcessHandler(commandLine)
+            CloudflaredProcessHandler(commandLine)
         } catch (e: ExecutionException) {
             thisLogger().info("Failed to start cloudflared", e)
             val summary = CloudflaredOutput.summarize(e.message.orEmpty(), NOT_STARTED)
@@ -159,10 +190,7 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
             },
         )
         handler.startNotify()
-        if (config.type == ConnectionType.ACCESS_TCP) {
-            scheduleAccessReadyFallback(config)
-            probeAccessListener(config)
-        }
+        if (config.type == ConnectionType.ACCESS_TCP) probeAccessListener(config)
     }
 
     fun stop(config: ConnectionConfig) {
@@ -193,37 +221,181 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
     }
 
     /**
-     * Not every cloudflared build announces its access listener in a way we recognise, and a status
-     * stuck on "Starting" forever would be worse than being slightly optimistic. If the process is
-     * still alive after the grace period and nothing asked for authentication, call it running.
-     */
-    private fun scheduleAccessReadyFallback(config: ConnectionConfig) {
-        AppExecutorUtil.getAppScheduledExecutorService().schedule({
-            if (states[config.id]?.status == ConnectionStatus.STARTING && isRunning(config)) {
-                markRunning(config)
-            }
-        }, ACCESS_READY_GRACE_SECONDS, TimeUnit.SECONDS)
-    }
-
-    /**
      * `cloudflared access tcp` does not talk to Cloudflare until something connects to its local
      * listener, so an expired token stays invisible — the connection looks fine and only fails when
      * the user finally points a client at it. Opening and immediately closing one socket forces that
      * round trip, which makes cloudflared print its SSO link at start-up instead.
+     *
+     * The connection is retried in short steps rather than waited out with one long delay, so the
+     * row leaves "Starting" as soon as the listener is actually up.
      */
     private fun probeAccessListener(config: ConnectionConfig) {
-        val port = config.localBind.substringAfterLast(':', "").toIntOrNull() ?: return
-        val host = config.localBind.substringBeforeLast(':', "").ifBlank { "localhost" }
-        AppExecutorUtil.getAppScheduledExecutorService().schedule({
-            if (!isRunning(config)) return@schedule
-            try {
-                Socket().use { it.connect(InetSocketAddress(host, port), PROBE_TIMEOUT_MILLIS) }
-            } catch (e: IOException) {
-                // The listener may not be up yet, or may be gone again. Neither is worth reporting:
-                // the probe exists to nudge cloudflared, not to decide whether it is healthy.
-                thisLogger().debug("Access listener probe failed", e)
+        if (socketAddress(config.localBind) == null) {
+            // Nothing to connect to. Do not leave the row stuck on "Starting" over it.
+            schedule(PROBE_SETTLE_MILLIS) { promoteIfStarting(config) }
+            return
+        }
+        probePending.add(config.id)
+        probeAttempt(config, attempt = 0)
+    }
+
+    private fun probeAttempt(config: ConnectionConfig, attempt: Int) {
+        schedule(if (attempt == 0) PROBE_FIRST_DELAY_MILLIS else PROBE_RETRY_MILLIS) {
+            if (!isRunning(config)) {
+                probePending.remove(config.id)
+                return@schedule
             }
-        }, PROBE_DELAY_MILLIS, TimeUnit.MILLISECONDS)
+            if (!connectToListener(config) && attempt + 1 < PROBE_MAX_ATTEMPTS) {
+                probeAttempt(config, attempt + 1)
+                return@schedule
+            }
+            // cloudflared answers the probe before it prints anything about authorization, so give
+            // the prompt a moment to win the race before calling the connection ready.
+            schedule(PROBE_SETTLE_MILLIS) {
+                probePending.remove(config.id)
+                promoteIfStarting(config)
+            }
+        }
+    }
+
+    /** Leaves an authorization prompt — or a failure — alone; only lifts the "Starting" placeholder. */
+    private fun promoteIfStarting(config: ConnectionConfig) {
+        if (states[config.id]?.status == ConnectionStatus.STARTING && isRunning(config)) markRunning(config)
+    }
+
+    private fun connectToListener(config: ConnectionConfig): Boolean = canConnect(config.localBind)
+
+    /** One connect-and-drop. Failure only ever means "not yet" to the caller. */
+    private fun canConnect(address: String): Boolean {
+        val target = socketAddress(address) ?: return false
+        return try {
+            Socket().use { it.connect(target, PROBE_TIMEOUT_MILLIS) }
+            true
+        } catch (e: IOException) {
+            thisLogger().debug("Probe of $address failed", e)
+            false
+        }
+    }
+
+    /** `tcp://localhost:5432`, `http://localhost:3000` and bare `localhost:8080` all turn up here. */
+    private fun socketAddress(address: String): InetSocketAddress? {
+        val hostPort = address.substringAfter("://", address).trim().trimEnd('/').substringBefore('/')
+        val host = hostPort.substringBeforeLast(':', "").ifBlank { hostPort }
+        val port = hostPort.substringAfterLast(':', "").toIntOrNull()
+            ?: defaultPort(address)
+            ?: return null
+        return if (host.isBlank() || port !in 1..MAX_PORT) null else InetSocketAddress(host, port)
+    }
+
+    private fun defaultPort(address: String): Int? = when {
+        address.startsWith("https://") -> HTTPS_PORT
+        address.startsWith("http://") -> HTTP_PORT
+        else -> null
+    }
+
+    /**
+     * cloudflared says nothing when a browser login finally succeeds, so the only way to notice is
+     * to connect again: a connection that goes through *without* producing a fresh authorization
+     * prompt means the token is good now.
+     *
+     * This cannot be polled. Every connection to an unauthorized client starts another login, and
+     * cloudflared answers the second one with "another cloudflared process is already waiting for
+     * authentication" and reprints the URL — so a poll produces a browser tab and a wall of log per
+     * round, and never gets a quiet answer to read. Instead it runs once when the IDE window comes
+     * back to the front, which is exactly what happens after a login finishes in the browser.
+     */
+    private fun recheckAuthorization() {
+        val now = System.currentTimeMillis()
+        if (now - lastAuthRecheck < AUTH_RECHECK_THROTTLE_MILLIS) return
+        lastAuthRecheck = now
+        connections.filter { awaitingAuth(it) }.forEach { config ->
+            val promptedBefore = authPromptAt[config.id]
+            schedule(0) {
+                connectToListener(config)
+                // A rejected connection reprints the prompt; give it time to arrive before reading.
+                schedule(AUTH_SETTLE_MILLIS) {
+                    if (awaitingAuth(config) && authPromptAt[config.id] == promptedBefore) markRunning(config)
+                }
+            }
+        }
+    }
+
+    /**
+     * A connection can stop working without the process noticing: for a quick tunnel the service it
+     * fronts can go away, and either kind can be killed from outside in a way the process handler
+     * misses. Nothing in the output says so, so poll.
+     *
+     * Only a quick tunnel is probed over a socket. An access client's listener is the process
+     * itself, so checking it is alive says everything a connection would — and every connection to
+     * an access client is a real Access round trip that is not worth making twice a second.
+     *
+     * An unreachable local service is a warning, never a failure: the tunnel is up and Cloudflare
+     * answers on it, with a 502 until the service is back. The loop keeps running while warned, so
+     * the warning clears itself the moment the service returns.
+     */
+    private fun scheduleHealthCheck(config: ConnectionConfig, failures: Int) {
+        schedule(HEALTH_INTERVAL_MILLIS) {
+            if (states[config.id]?.status != ConnectionStatus.RUNNING) {
+                healthWatched.remove(config.id)
+                return@schedule
+            }
+            if (!isRunning(config)) {
+                healthWatched.remove(config.id)
+                setState(config, ConnectionState(ConnectionStatus.STOPPED))
+                return@schedule
+            }
+            val checkable = config.type == ConnectionType.QUICK_TUNNEL && socketAddress(config.target) != null
+            if (!checkable || canConnect(config.target)) {
+                setWarning(config, "")
+                scheduleHealthCheck(config, failures = 0)
+                return@schedule
+            }
+            // One refusal is the local service being restarted; two in a row is it being gone.
+            val seen = (failures + 1).coerceAtMost(HEALTH_FAILURES_ALLOWED)
+            if (seen >= HEALTH_FAILURES_ALLOWED) setWarning(config, ORIGIN_UNREACHABLE)
+            scheduleHealthCheck(config, seen)
+        }
+    }
+
+    /** Warnings ride along with RUNNING rather than replacing it. */
+    private fun setWarning(config: ConnectionConfig, warning: String) {
+        val current = states[config.id] ?: return
+        if (current.status != ConnectionStatus.RUNNING || current.warning == warning) return
+        setState(config, current.copy(warning = warning))
+    }
+
+    private fun awaitingAuth(config: ConnectionConfig): Boolean =
+        states[config.id]?.status == ConnectionStatus.AWAITING_AUTH && isRunning(config)
+
+    /** The timestamp is what [recheckAuthorization] compares against to spot a quiet round trip. */
+    private fun setAwaitingAuth(config: ConnectionConfig, state: ConnectionState) {
+        authPromptAt[config.id] = System.currentTimeMillis()
+        setState(config, state)
+    }
+
+    /**
+     * A failure the process itself shrugs off. cloudflared keeps its listener open after an origin
+     * it can never reach, which leaves a connection that looks alive and serves nothing, so take it
+     * down — and remember why, or [StatusListener] would overwrite the reason with "Stopped".
+     */
+    private fun failAndStop(config: ConnectionConfig, summary: String) {
+        setState(config, ConnectionState(ConnectionStatus.FAILED, summary))
+        fatalError.add(config.id)
+        handlers[config.id]?.destroyProcess()
+    }
+
+    private fun schedule(delayMillis: Long, action: () -> Unit) {
+        AppExecutorUtil.getAppScheduledExecutorService().schedule(action, delayMillis, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * A tunnel says its piece at start-up and then goes quiet for hours. Left on the default reader
+     * options the platform polls it constantly and eventually logs a warning about it; the silent
+     * options back off to a blocking read instead, which costs nothing while nothing is happening.
+     */
+    private class CloudflaredProcessHandler(commandLine: GeneralCommandLine) :
+        KillableColoredProcessHandler(commandLine) {
+        override fun readerOptions(): BaseOutputReader.Options = BaseOutputReader.Options.forMostlySilentProcess()
     }
 
     /** Streams output looking for the few lines that carry status. Called off the EDT. */
@@ -240,20 +412,27 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
                 }
 
                 ConnectionType.ACCESS_TCP -> {
+                    if (CloudflaredOutput.hasOriginFailure(text)) {
+                        failAndStop(config, CloudflaredOutput.summarize(text, NOT_STARTED))
+                        return
+                    }
                     // Order matters: the login prompt is printed before the listener line, and only
                     // the prompt is worth surfacing while it is pending.
                     CloudflaredOutput.findLoginUrl(text)?.let { url ->
-                        setState(config, ConnectionState(ConnectionStatus.AWAITING_AUTH, authUrl = url))
+                        setAwaitingAuth(config, ConnectionState(ConnectionStatus.AWAITING_AUTH, authUrl = url))
                         return
                     }
                     if (CloudflaredOutput.hasLoginPrompt(text)) {
-                        setState(
+                        setAwaitingAuth(
                             config,
                             ConnectionState(ConnectionStatus.AWAITING_AUTH, "Open the link in the log"),
                         )
                         return
                     }
-                    if (CloudflaredOutput.hasAccessListener(text)) {
+                    // While the probe is in flight this line means nothing — the listener binds long
+                    // before anyone knows whether the token is still good. Once the probe is done it
+                    // is the one signal that a completed browser login has put the client to work.
+                    if (config.id !in probePending && CloudflaredOutput.hasAccessListener(text)) {
                         markRunning(config)
                         return
                     }
@@ -266,7 +445,12 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
 
         override fun processTerminated(event: ProcessEvent) {
             handlers.remove(config.id)
+            probePending.remove(config.id)
+            authPromptAt.remove(config.id)
+            healthWatched.remove(config.id)
             val stopped = stopRequested.remove(config.id) || event.exitCode in SIGNAL_EXIT_CODES
+            // The reason is already on screen and is more use than "Stopped".
+            if (fatalError.remove(config.id)) return
             val state = if (event.exitCode == 0 || stopped) {
                 ConnectionState(ConnectionStatus.STOPPED)
             } else {
@@ -284,6 +468,7 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
             ?.runningSince
             ?: System.currentTimeMillis()
         setState(config, ConnectionState(ConnectionStatus.RUNNING, publicUrl = publicUrl, runningSince = since))
+        if (healthWatched.add(config.id)) scheduleHealthCheck(config, failures = 0)
     }
 
     private fun setState(config: ConnectionConfig, newState: ConnectionState) {
@@ -316,11 +501,33 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
          */
         private val SIGNAL_EXIT_CODES = setOf(130, 137, 143)
 
-        private const val ACCESS_READY_GRACE_SECONDS = 5L
+        /** Short enough that the user reads it as "on start", long enough to usually hit first try. */
+        private const val PROBE_FIRST_DELAY_MILLIS = 100L
+        private const val PROBE_RETRY_MILLIS = 500L
 
-        /** Long enough for the listener to bind, short enough that the user sees it as "on start". */
-        private const val PROBE_DELAY_MILLIS = 1500L
-        private const val PROBE_TIMEOUT_MILLIS = 2000
+        /** 100ms + 19 × 500ms ≈ 10s before giving up and trusting the process. */
+        private const val PROBE_MAX_ATTEMPTS = 20
+        private const val PROBE_TIMEOUT_MILLIS = 1000
+
+        /**
+         * Grace for the authorization prompt to arrive after the listener answers. cloudflared
+         * accepts the connection first and only then discovers it has no usable token, so promoting
+         * too eagerly shows "Running" for a moment before the row corrects itself.
+         */
+        private const val PROBE_SETTLE_MILLIS = 2000L
+
+        private const val AUTH_SETTLE_MILLIS = 1000L
+
+        /** Activation can fire several times over a single alt-tab. */
+        private const val AUTH_RECHECK_THROTTLE_MILLIS = 3000L
+
+        private const val HEALTH_INTERVAL_MILLIS = 2000L
+        private const val HEALTH_FAILURES_ALLOWED = 2
+        private const val ORIGIN_UNREACHABLE = "local service is down, public URL returns 502"
+
+        private const val MAX_PORT = 65535
+        private const val HTTP_PORT = 80
+        private const val HTTPS_PORT = 443
 
         /** No exit code exists when the process never got off the ground. */
         private const val NOT_STARTED = -1

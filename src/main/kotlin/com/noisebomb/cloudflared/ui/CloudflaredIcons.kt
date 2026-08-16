@@ -13,6 +13,13 @@ object CloudflaredIcons {
     val QuickTunnel: Icon = IconLoader.getIcon("/icons/quickTunnel.svg", CloudflaredIcons::class.java)
     val AccessClient: Icon = IconLoader.getIcon("/icons/accessClient.svg", CloudflaredIcons::class.java)
 
+    /**
+     * `AllIcons.RunConfigurations.TestNotRan` is the same idea and costs no files, but the New UI
+     * draws it at r=2, which disappears next to the checkmark and the warning triangle. Nothing
+     * bundled is a plain grey dot at this weight, so it is drawn here.
+     */
+    val Stopped: Icon = IconLoader.getIcon("/icons/statusStopped.svg", CloudflaredIcons::class.java)
+
     fun of(type: ConnectionType): Icon = when (type) {
         ConnectionType.QUICK_TUNNEL -> QuickTunnel
         ConnectionType.ACCESS_TCP -> AccessClient
@@ -24,7 +31,7 @@ object CloudflaredIcons {
      * [com.intellij.ui.AnimatedIcon.ANIMATION_IN_RENDERER_ALLOWED] on the table to actually turn.
      */
     fun of(status: ConnectionStatus): Icon = when (status) {
-        ConnectionStatus.STOPPED -> AllIcons.Process.Step_passive
+        ConnectionStatus.STOPPED -> Stopped
         ConnectionStatus.STARTING -> AnimatedIcon.Default.INSTANCE
         ConnectionStatus.RUNNING -> AllIcons.General.InspectionsOK
         ConnectionStatus.AWAITING_AUTH -> AllIcons.General.Warning

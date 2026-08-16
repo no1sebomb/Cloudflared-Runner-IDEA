@@ -24,9 +24,15 @@ object CloudflaredOutput {
     /** Log lines wrap the URL in quotes or brackets often enough to be worth trimming. */
     private const val URL_TRAILING_JUNK = ".,;:'\")]}"
 
-    /** Same situation, but the wording rather than the URL — printed just above the link. */
+    /**
+     * Same situation, but the wording rather than the URL — printed just above the link. The last
+     * alternative is what a *second* connection gets while a first login is still outstanding;
+     * cloudflared reprints the whole block, so it has to count as a prompt or the status would flip
+     * to running on the strength of the reprint.
+     */
     private val ACCESS_LOGIN_PROMPT = Regex(
-        """(?i)please open the following url|open the following url in your browser""",
+        """(?i)please (?:open|visit) the following url|open the following url in your browser""" +
+            """|already waiting for authentication""",
     )
 
     /**
@@ -34,6 +40,12 @@ object CloudflaredOutput {
      * `INF Start Websocket listener host=localhost:5433`.
      */
     private val ACCESS_LISTENER = Regex("""(?i)start websocket listener|start server listener|listening on""")
+
+    /**
+     * `ERR failed to connect to origin error="dial tcp: lookup … no such host"` — an access client
+     * that cannot reach what it fronts. The listener stays up regardless, so nothing else notices.
+     */
+    private val ORIGIN_FAILURE = Regex("""(?i)failed to connect to origin""")
 
     /** `2026-08-15T10:11:12Z ERR ` and friends — noise in front of every real message. */
     private val LOG_PREFIX = Regex("""^\S*T\S*Z?\s+(TRC|DBG|INF|WRN|ERR|FTL)\s+""")
@@ -78,6 +90,8 @@ object CloudflaredOutput {
         ACCESS_LOGIN_URL.find(text)?.value?.trimEnd(*URL_TRAILING_JUNK.toCharArray())
 
     fun hasAccessListener(text: String): Boolean = ACCESS_LISTENER.containsMatchIn(text)
+
+    fun hasOriginFailure(text: String): Boolean = ORIGIN_FAILURE.containsMatchIn(text)
 
     /**
      * One short line for the status column. [stderr] is the last non-empty stderr line seen, which

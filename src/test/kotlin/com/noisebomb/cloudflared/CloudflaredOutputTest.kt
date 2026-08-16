@@ -39,6 +39,15 @@ class CloudflaredOutputTest {
     }
 
     @Test
+    fun `counts the reprint for a queued login as a prompt`() {
+        // What a second connection gets while the first login is still outstanding.
+        val line = "Another cloudflared process (pid 196108) is already waiting for authentication."
+        assertTrue(CloudflaredOutput.hasLoginPrompt(line))
+        val fallback = "If a browser window did not open, please visit the following URL:"
+        assertTrue(CloudflaredOutput.hasLoginPrompt(fallback))
+    }
+
+    @Test
     fun `keeps the query string of a login url`() {
         val line = "Please open the following URL: https://team.cloudflareaccess.com/cdn-cgi/access/cli?aud=abc&t=1."
         assertEquals(
@@ -52,6 +61,16 @@ class CloudflaredOutputTest {
     fun `detects the access listener coming up`() {
         assertTrue(CloudflaredOutput.hasAccessListener("INF Start Websocket listener host=localhost:5433"))
         assertFalse(CloudflaredOutput.hasAccessListener("INF Requesting new quick Tunnel"))
+    }
+
+    @Test
+    fun `detects an origin the access client cannot reach`() {
+        val line = "2026-08-16T11:59:19Z ERR failed to connect to origin " +
+            "error=\"dial tcp: lookup db.example.com on 127.0.0.53:53: no such host\" " +
+            "originURL=https://db.example.com"
+        assertTrue(CloudflaredOutput.hasOriginFailure(line))
+        assertEquals("Hostname could not be resolved", CloudflaredOutput.summarize(line, -1))
+        assertFalse(CloudflaredOutput.hasOriginFailure("INF Start Websocket listener host=localhost:5433"))
     }
 
     @Test
