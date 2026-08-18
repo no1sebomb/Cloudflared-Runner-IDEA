@@ -13,6 +13,11 @@ and shows both ends of the connection in a table. Closing the project kills ever
 
 ![Creating a quick tunnel and starting it](docs/usage.gif)
 
+> [!NOTE]
+> Some parts of the source code were written with the help of AI,
+> since I have no experience with Kotlin and the IntelliJ Platform SDK.
+> However, I have reviewed and tested all generated code to ensure it works as intended.
+
 ## Connection types
 
 | Type | Command | Route shown |
@@ -59,7 +64,7 @@ Open the **Cloudflared Runner** tool window on the right edge.
 - Right-click → **Addresses** opens or copies the row's public URL or local address. A running quick
   tunnel's hostname is also a link in the route column.
 - The lower pane is that connection's console — output is per connection and survives stopping.
-- A connection can carry a colour, which tints its row; useful once the list gets long.
+- A connection can carry a color, which tints its row; useful once the list gets long.
 
 ![The tool window with several connections](docs/table.png)
 
@@ -104,8 +109,21 @@ src/main/kotlin/com/noisebomb/cloudflared/
     └── CloudflaredIcons.kt       Type and status icons
 ```
 
-Built with the [IntelliJ Platform Gradle Plugin][gradle-plugin], targeting IntelliJ 2025.3 (build
-253) and later.
+Built with the [IntelliJ Platform Gradle Plugin][gradle-plugin], targeting IntelliJ 2025.3 (build 253) and later.
+
+## Installation
+
+### From JetBrains Marketplace
+
+Plugin is available on [JetBrains Marketplace](https://plugins.jetbrains.com/plugin/33638-cloudflared-runner).
+
+Alternatively, you can open `Settings` > `Plugins` > `Marketplace` and search for **Cloudflared Runner**
+
+### Manual Installation
+
+1. Download latest release from [GitHub Releases](https://github.com/no1sebomb/Cloudflared-Runner-IDEA/releases)
+2. In **IntelliJ IDEA**, go to `Settings` > `Plugins` > `Install Plugin from Disk...`
+3. Select the downloaded `.zip` file and install.
 
 ## Trademarks
 
