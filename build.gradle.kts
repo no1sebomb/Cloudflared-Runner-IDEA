@@ -77,6 +77,10 @@ intellijPlatform {
         // Compilation already pins the oldest supported build (sinceBuild 253), so the
         // verifier's job is catching APIs removed since then — the newest IDE is enough.
         // `recommended()` adds every release in the open-ended range: several GB more per run.
+        //
+        // `latest()` resolves to Ultimate, which is more IDE than a platform-only plugin needs,
+        // but narrowing it with a `types` filter resolves to no releases at all in 2.18.1 — the
+        // CI job frees disk space instead. Worth retrying on a later plugin version.
         ides {
             latest()
         }

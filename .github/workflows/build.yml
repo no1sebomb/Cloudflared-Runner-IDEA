@@ -66,6 +66,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The verifier downloads an IDE and unpacks every bundled plugin it ships with — several
+      # GB — and the runner image does not have room for that alongside its preinstalled
+      # toolchains. It fills the disk *after* verifying, while writing the HTML report, so the
+      # failure looks like a verification failure and is not one.
+      #
+      # Runs before setup-java on purpose: the Android SDK is by far the biggest of these, and
+      # deleting it costs nothing here because nothing in this job is going to build for Android.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h /
+
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
