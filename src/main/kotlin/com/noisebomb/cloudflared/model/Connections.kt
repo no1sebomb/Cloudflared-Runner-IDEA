@@ -170,12 +170,12 @@ data class ConnectionConfig(
         }
     }
 
-    fun displayName(): String = name.ifBlank {
-        when (type) {
-            ConnectionType.QUICK_TUNNEL -> target
-            ConnectionType.ACCESS_TCP -> "$target → $localBind"
-        }
-    }
+    /**
+     * A name is required by the dialog, so the fallback only covers connections saved before it
+     * was. Just the target: the route column already spells out both ends of the connection, and
+     * repeating it in the name column would put the same string on the row twice.
+     */
+    fun displayName(): String = name.ifBlank { target }
 
     /**
      * The address on this machine. For a quick tunnel that is the service being exposed; for an

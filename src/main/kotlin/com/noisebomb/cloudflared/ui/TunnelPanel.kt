@@ -70,7 +70,8 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
 
     private val service = TunnelService.getInstance(project)
 
-    private val columns = arrayOf<ColumnInfo<ConnectionConfig, *>>(NameColumn(), TypeColumn(), StatusColumn())
+    private val columns =
+        arrayOf<ColumnInfo<ConnectionConfig, *>>(NameColumn(), TypeColumn(), RouteColumn(), StatusColumn())
     private val tableModel = ListTableModel(columns, service.connections.toMutableList())
     private val table = TableView(tableModel)
 
@@ -124,10 +125,15 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         table.setShowGrid(false)
         table.rowHeight = JBUI.scale(22)
         table.emptyText.text = "No connections"
-        table.autoResizeMode = JTable.AUTO_RESIZE_LAST_COLUMN
-        table.columnModel.getColumn(NAME_COLUMN).preferredWidth = JBUI.scale(180)
-        table.columnModel.getColumn(TYPE_COLUMN).preferredWidth = JBUI.scale(104)
-        table.columnModel.getColumn(TYPE_COLUMN).maxWidth = JBUI.scale(220)
+        // Every column shares the resize, rather than the last one absorbing all the slack: with
+        // AUTO_RESIZE_LAST_COLUMN the widths below would only hold until the first resize, after
+        // which Status ate everything the other three did not claim.
+        table.autoResizeMode = JTable.AUTO_RESIZE_ALL_COLUMNS
+        sizeColumn(NAME_COLUMN, NAME_WIDTH, minWidth = 90)
+        // Two strings and an icon, and it never has anything else to say, so it stops growing.
+        sizeColumn(TYPE_COLUMN, TYPE_WIDTH, minWidth = 96, maxWidth = 132)
+        sizeColumn(ROUTE_COLUMN, ROUTE_WIDTH, minWidth = 120)
+        sizeColumn(STATUS_COLUMN, STATUS_WIDTH, minWidth = 96)
 
         table.selectionModel.addListSelectionListener {
             if (!it.valueIsAdjusting) {
@@ -167,7 +173,7 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
                 lastClickButton = e.button
                 if (e.button != MouseEvent.BUTTON1) return
                 if (e.clickCount == 1) {
-                    authUrlAt(e.point)?.let { BrowserUtil.browse(it) }
+                    linkAt(e.point)?.let { BrowserUtil.browse(it) }
                     return
                 }
                 // AWT counts clicks by time and position rather than by button, so the left click
@@ -180,7 +186,7 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         })
         table.addMouseMotionListener(object : MouseAdapter() {
             override fun mouseMoved(e: MouseEvent) {
-                val overLink = authUrlAt(e.point) != null
+                val overLink = linkAt(e.point) != null
                 table.cursor = Cursor.getPredefinedCursor(
                     if (overLink) Cursor.HAND_CURSOR else Cursor.DEFAULT_CURSOR,
                 )
@@ -188,12 +194,46 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         })
     }
 
-    private fun authUrlAt(point: Point): String? {
+    /**
+     * The URL under the pointer, if the cell there is painted as a link: the SSO prompt in the
+     * status column, or the generated public URL in the route column.
+     */
+    private fun linkAt(point: Point): String? {
         val row = table.rowAtPoint(point)
         val column = table.columnAtPoint(point)
-        if (row < 0 || column < 0 || table.convertColumnIndexToModel(column) != STATUS_COLUMN) return null
-        val state = tableModel.getItem(row)?.let { service.stateOf(it) } ?: return null
-        return state.authUrl.takeIf { it.isNotBlank() && state.status == ConnectionStatus.AWAITING_AUTH }
+        if (row < 0 || column < 0) return null
+        val config = tableModel.getItem(row) ?: return null
+        val state = service.stateOf(config)
+        return when (table.convertColumnIndexToModel(column)) {
+            STATUS_COLUMN ->
+                state.authUrl.takeIf { it.isNotBlank() && state.status == ConnectionStatus.AWAITING_AUTH }
+            ROUTE_COLUMN -> routeEntry(config).takeIf { it.startsWith("http") }
+            else -> null
+        }
+    }
+
+    /**
+     * Where you connect to reach the service in [ConnectionConfig.target]. For a quick tunnel that
+     * is the hostname cloudflared generated, so it is empty until the tunnel is up; for an access
+     * client it is the listener, which is known before anything runs.
+     */
+    private fun routeEntry(config: ConnectionConfig): String = when (config.type) {
+        ConnectionType.QUICK_TUNNEL -> service.stateOf(config).publicUrl
+        ConnectionType.ACCESS_TCP -> config.localBind
+    }
+
+    /**
+     * [fraction] is of the whole table. Under [JTable.AUTO_RESIZE_ALL_COLUMNS] the preferred widths
+     * are the ratio space is handed out in, so the fractions hold at any width; resolving them
+     * against a nominal width here just makes the first paint, before any resize, sensible too.
+     *
+     * Order matters: `setPreferredWidth` clamps to the bounds already on the column.
+     */
+    private fun sizeColumn(index: Int, fraction: Double, minWidth: Int, maxWidth: Int? = null) {
+        val column = table.columnModel.getColumn(index)
+        column.minWidth = JBUI.scale(minWidth)
+        maxWidth?.let { column.maxWidth = JBUI.scale(it) }
+        column.preferredWidth = JBUI.scale((NOMINAL_TABLE_WIDTH * fraction).toInt())
     }
 
     private fun placeholder(): JPanel = JPanel(BorderLayout())
@@ -726,6 +766,34 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         }
     }
 
+    /**
+     * Which service this connection reaches and the address that reaches it, always in that order.
+     * The two types run the traffic in opposite directions — a quick tunnel carries the public in,
+     * an access client dials out — so labelling the ends "from" and "to" would mean the opposite
+     * thing on neighbouring rows. Service first, entry point second, holds for both.
+     */
+    private inner class RouteColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Route") {
+        override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
+
+        override fun getRenderer(item: ConnectionConfig) = object : RowRenderer() {
+            override fun render(table: JTable, config: ConnectionConfig, row: Int) {
+                val entry = routeEntry(config)
+                append(config.target)
+                append(ROUTE_ARROW, SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                when {
+                    entry.isBlank() -> append(NO_ENTRY_POINT, SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    // Only a quick tunnel's generated hostname is a URL a browser can open; the
+                    // mouse handler opens whatever this branch paints as a link.
+                    entry.startsWith("http") -> append(entry, SimpleTextAttributes.LINK_ATTRIBUTES)
+                    else -> append(entry)
+                }
+                // The column is the first thing squeezed in a narrow tool window, and either end of
+                // a route is long enough to be clipped there.
+                toolTipText = "${config.target}$ROUTE_ARROW${entry.ifBlank { NO_ENTRY_POINT }}"
+            }
+        }
+    }
+
     /** Status, uptime and the one useful address, so a failure is obvious without opening the log. */
     private inner class StatusColumn : ColumnInfo<ConnectionConfig, ConnectionConfig>("Status") {
         override fun valueOf(item: ConnectionConfig): ConnectionConfig = item
@@ -761,6 +829,9 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
                 if (state.warning.isNotBlank()) {
                     append("  ${state.warning}", WARNING_ATTRIBUTES)
                 }
+                // No longer the column that soaks up the leftover width, and a detail or a warning
+                // is long enough to be clipped by the share it does get.
+                toolTipText = getCharSequence(false).toString().trim().ifBlank { null }
             }
         }
     }
@@ -772,9 +843,23 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         const val POPUP_PLACE = "CloudflaredRunnerPopup"
         const val NAME_COLUMN = 0
         const val TYPE_COLUMN = 1
-        const val STATUS_COLUMN = 2
+        const val ROUTE_COLUMN = 2
+        const val STATUS_COLUMN = 3
+        const val ROUTE_ARROW = " \u2192 "
+
+        /** A quick tunnel has no public hostname until cloudflared prints one. */
+        const val NO_ENTRY_POINT = "\u2014"
         const val EXTERNAL_LINK_ARROW = "\u2197"
         const val LOG_SPLIT_PROPORTION = 0.72f
+
+        /** Fractions of the table each column gets. They sum to one; see `sizeColumn`. */
+        const val NAME_WIDTH = 0.24
+        const val TYPE_WIDTH = 0.16
+        const val ROUTE_WIDTH = 0.38
+        const val STATUS_WIDTH = 0.22
+
+        /** The width the fractions are resolved against for the very first paint. */
+        const val NOMINAL_TABLE_WIDTH = 720
 
         /** Amber, not red: whatever it says, the connection is still up. */
         val WARNING_ATTRIBUTES = SimpleTextAttributes(
