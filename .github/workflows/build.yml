@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
 
@@ -30,7 +30,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           validate-wrappers: true
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          cache-read-only: ${{ !contains(fromJSON('["refs/heads/main", "refs/heads/dev"]'), github.ref) }}
 
       # `check` runs ktlintCheck + test; verifyPluginProjectConfiguration catches
       # plugin.xml / gradle.properties mismatches (sinceBuild, dependencies, …).
@@ -56,12 +56,14 @@ jobs:
             build/reports/ktlint/**
           if-no-files-found: ignore
 
-  # The verifier downloads and unpacks a full IDE (several GB), so it runs on main
-  # and on demand rather than on every pull request.
+  # The verifier downloads and unpacks a full IDE (several GB), so it is kept off pull
+  # requests and off ordinary `dev` pushes. `main` covers the merge that precedes a release,
+  # and `workflow_dispatch` covers running it on `dev` deliberately before merging — which is
+  # the moment it is actually worth the five minutes.
   verify:
     name: Plugin Verifier
     needs: build
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -88,7 +90,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           validate-wrappers: true
-          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+          cache-read-only: ${{ !contains(fromJSON('["refs/heads/main", "refs/heads/dev"]'), github.ref) }}
 
       # The IDE installer comes from the Gradle cache; ~/.pluginVerifier (the unpacked
       # bundled plugins, several GB) is regenerated from it and deliberately not cached.
