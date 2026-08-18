@@ -2,21 +2,22 @@
 <idea-plugin>
     <id>com.noisebomb.cloudflared-runner</id>
     <name>Cloudflared Runner</name>
-    <vendor>noisebomb</vendor>
+    <vendor email="noisebombch@gmail.com" url="https://github.com/no1sebomb">noisebomb</vendor>
 
     <description><![CDATA[
         Runs <code>cloudflared</code> quick tunnels and Access clients from a tool window instead of a
         terminal tab.<br><br>
         <ul>
-          <li><b>Quick tunnel</b> — <code>cloudflared tunnel --url &lt;target&gt;</code>, with the generated
-              <code>trycloudflare.com</code> hostname shown in the status column.</li>
-          <li><b>Access client</b> — <code>cloudflared access tcp --hostname &lt;host&gt; --url &lt;bind&gt;</code>,
-              showing the local bind address.</li>
+          <li><b>Quick tunnel</b> — <code>cloudflared tunnel --url &lt;target&gt;</code>. The route column
+              shows the local service and the generated <code>trycloudflare.com</code> hostname.</li>
+          <li><b>Access client</b> — <code>cloudflared access tcp --hostname &lt;host&gt; --url &lt;bind&gt;</code>.
+              The route column shows the Access hostname and the local listener it opens.</li>
         </ul>
         Output is streamed into a per-connection console, so login prompts and auth URLs stay visible.
         Running processes are killed when the project closes.<br><br>
-        Requires <code>cloudflared</code> on <code>PATH</code>. The plugin does no Cloudflare API calls and
-        handles no credentials — <code>cloudflared</code> does its own authentication.<br><br>
+        Requires <code>cloudflared</code> on <code>PATH</code>, or an explicit path per connection. The plugin
+        does no Cloudflare API calls and handles no credentials — <code>cloudflared</code> does its own
+        authentication.<br><br>
         <em>Not affiliated with Cloudflare, Inc. "Cloudflare" and "cloudflared" are trademarks of
         Cloudflare, Inc.</em>
         ]]></description>

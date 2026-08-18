@@ -1,3 +1,4 @@
+import org.jetbrains.changelog.Changelog
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 import org.jlleitschuh.gradle.ktlint.reporter.ReporterType
 
@@ -26,6 +27,13 @@ dependencies {
     }
 }
 
+changelog {
+    // The plugin's own headings ("Added", "Fixed") are the grouping; an empty set stops
+    // `patchChangelog` from adding a second, empty layer of them.
+    groups.empty()
+    repositoryUrl = "https://github.com/no1sebomb/Cloudflared-Runner-IDEA"
+}
+
 // Rules are configured in .editorconfig.
 ktlint {
     version = "1.8.0"
@@ -39,6 +47,24 @@ ktlint {
 intellijPlatform {
     pluginConfiguration {
         name = "Cloudflared Runner"
+
+        // The Marketplace "What's New" tab. Falls back to [Unreleased] so a build made between
+        // releases still shows the notes that are about to ship.
+        //
+        // Goes through `changelog.instance` rather than the extension's own `getOrNull`/`renderItem`
+        // helpers: those resolve against the extension, which drags a `Project` reference into the
+        // provider, and the configuration cache refuses to serialize one.
+        changeNotes = changelog.instance.zip(providers.gradleProperty("version")) { log, pluginVersion ->
+            val item = log.items[pluginVersion] ?: log.unreleasedItem
+            // Null when the changelog has neither this version nor an [Unreleased] section, which
+            // is a changelog worth nothing to the Marketplace anyway.
+            item?.let {
+                log.renderItem(
+                    it.withHeader(false).withEmptySections(false),
+                    Changelog.OutputType.HTML,
+                )
+            }.orEmpty()
+        }
 
         ideaVersion {
             sinceBuild = "253"

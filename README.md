@@ -1,21 +1,40 @@
-# Cloudflared Runner
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="src/main/resources/META-INF/pluginIcon_dark.svg">
+    <img src="src/main/resources/META-INF/pluginIcon.svg" alt="" width="32" height="32" align="top">
+  </picture>
+  Cloudflared Runner
+</h1>
 
 An IntelliJ IDEA plugin that runs `cloudflared` from a tool window instead of a terminal tab.
 
 Add a connection, hit start, and the plugin spawns the process, streams its output into a console,
-and shows the useful bit of status — the generated `trycloudflare.com` hostname or the local bind
-address — in a table. Closing the project kills every running process.
+and shows both ends of the connection in a table. Closing the project kills every running process.
+
+![Creating a quick tunnel and starting it](docs/usage.gif)
 
 ## Connection types
 
-| Type | Command | Status shown |
+| Type | Command | Route shown |
 | --- | --- | --- |
-| **Quick tunnel** | `cloudflared tunnel --url <target>` | The generated `https://<name>.trycloudflare.com` hostname, scraped from stderr |
-| **Access client** | `cloudflared access tcp --hostname <host> --url <bind>` | The local bind address, e.g. `localhost:5433` |
+| **Quick tunnel** | `cloudflared tunnel --url <target>` | `localhost:8080 → abc.trycloudflare.com`, the hostname scraped from stderr |
+| **Access client** | `cloudflared access <proto> --hostname <host> --url <bind>` | `db.example.com → localhost:5433` |
+
+The route column always reads *service → the address that reaches it*. The two types run traffic in
+opposite directions, so labelling the ends "from" and "to" would mean opposite things on adjacent
+rows; this order holds for both.
 
 A quick tunnel is anonymous and ephemeral — no account, no login. An access client is the *client*
 side of Cloudflare Access: it opens a local listener in front of a service that already sits behind
 an Access policy. It does not create a tunnel.
+
+Each type gets its own form, since they have little in common beyond a name and a colour. Every
+address is checked as you type — reachable, resolvable, port free — and the exact command that will
+be run is shown at the bottom, ready to copy.
+
+| Quick tunnel | Access client |
+| --- | --- |
+| ![Add Quick tunnel dialog](docs/quick-tunnel.png) | ![Edit Access client dialog](docs/access-client.png) |
 
 ## Authentication
 
@@ -23,21 +42,26 @@ The plugin never touches credentials. `cloudflared` opens the browser, catches t
 redirect, and caches its own short-lived token under `~/.cloudflared/`. The plugin only streams
 output, so login prompts stay visible — including the manual auth URL cloudflared prints when it
 cannot open a browser (headless or remote sessions). That case shows up in the status column as
-"Login required — see log".
+"Authorization required", which is a link straight to the URL cloudflared printed.
 
 ## Requirements
 
-`cloudflared` must be on `PATH`. If it is not, starting a connection fails with the launch error in
-the status column.
+`cloudflared` on `PATH`, or an explicit path in a connection's **Executable** field. Either way the
+dialog runs `--version` against it as you type and says so before you save — whether it is missing,
+or is some other program that answered with something other than a cloudflared version banner.
 
 ## Usage
 
 Open the **Cloudflared Runner** tool window on the right edge.
 
-- **+** adds a connection; pick *Quick tunnel* or *Access client* in the dialog.
-- Select a row and use ▶ / ⏸ in the toolbar, or double-click the row, to start and stop it.
-- The copy button puts the row's URL or bind address on the clipboard.
+- **+** adds a connection; pick *Quick tunnel* or *Access client*, since their forms differ.
+- Select a row and use ▶ / ■ in the toolbar to start and stop it. Double-clicking a row edits it.
+- Right-click → **Addresses** opens or copies the row's public URL or local address. A running quick
+  tunnel's hostname is also a link in the route column.
 - The lower pane is that connection's console — output is per connection and survives stopping.
+- A connection can carry a colour, which tints its row; useful once the list gets long.
+
+![The tool window with several connections](docs/table.png)
 
 Connections are stored per project in `.idea/cloudflaredRunner.xml`.
 
@@ -65,14 +89,19 @@ Source layout:
 
 ```
 src/main/kotlin/com/noisebomb/cloudflared/
-├── model/Connections.kt          Connection config, type, live state
+├── model/Connections.kt          Connection config, type, colour, live state
 ├── service/
 │   ├── TunnelService.kt          Project service: connection list, process lifecycle, persistence
-│   └── CloudflaredOutput.kt      Parsing of the few meaningful output lines
+│   ├── CloudflaredOutput.kt      Parsing of the few meaningful output lines
+│   ├── CloudflaredBinary.kt      `--version` probe behind the Executable field
+│   └── HostProbe.kt              Socket, DNS and HTTP checks used by the dialog's validation
 └── ui/
     ├── TunnelToolWindowFactory.kt
     ├── TunnelPanel.kt            Table of connections + per-connection console
-    └── ConnectionDialog.kt       Add/edit form
+    ├── ConnectionDialog.kt       Add/edit form, with live validation of every address
+    ├── CommandPreview.kt         The copyable startup command shown in the dialog
+    ├── ConnectionColors.kt       Row tints and swatches
+    └── CloudflaredIcons.kt       Type and status icons
 ```
 
 Built with the [IntelliJ Platform Gradle Plugin][gradle-plugin], targeting IntelliJ 2025.3 (build
