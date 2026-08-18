@@ -35,19 +35,29 @@ object HostProbe {
         return if (host.isBlank() || port !in 1..MAX_PORT) null else InetSocketAddress(host, port)
     }
 
-    /** One connect-and-drop. Failure only ever means "not right now" to the caller. */
+    /**
+     * One connect-and-drop. Failure only ever means "not right now" to the caller.
+     *
+     * Every address the name resolves to is tried, not just the first. `localhost` is two addresses
+     * on a dual-stack machine — `::1` and `127.0.0.1` — and a server bound to one refuses the other,
+     * so probing a single address reports "nothing is listening" for a service that is plainly up.
+     * Anything that would actually reach it (curl, cloudflared, `Socket(host, port)`) walks the whole
+     * list; [Socket.connect] with an already-resolved address is the one thing that does not.
+     */
     fun canConnect(
         address: String,
         fallbackPort: Int? = null,
         timeoutMillis: Int = DEFAULT_TIMEOUT_MILLIS,
     ): Boolean {
         val target = socketAddress(address, fallbackPort) ?: return false
-        return try {
-            Socket().use { it.connect(target, timeoutMillis) }
-            true
-        } catch (e: IOException) {
-            thisLogger().debug("Probe of $address failed", e)
-            false
+        return candidates(target).any { candidate ->
+            try {
+                Socket().use { it.connect(InetSocketAddress(candidate, target.port), timeoutMillis) }
+                true
+            } catch (e: IOException) {
+                thisLogger().debug("Probe of $candidate:${target.port} failed", e)
+                false
+            }
         }
     }
 
@@ -58,15 +68,19 @@ object HostProbe {
      */
     fun isPortAvailable(address: String): Boolean {
         val target = socketAddress(address) ?: return true
-        return try {
-            ServerSocket().use {
-                it.reuseAddress = false
-                it.bind(target)
+        // Free on every address the name covers, for the same dual-stack reason as [canConnect]:
+        // cloudflared will take whichever of them it can, so one taken address is a taken port.
+        return candidates(target).all { candidate ->
+            try {
+                ServerSocket().use {
+                    it.reuseAddress = false
+                    it.bind(InetSocketAddress(candidate, target.port))
+                }
+                true
+            } catch (e: IOException) {
+                thisLogger().debug("Bind test of $candidate:${target.port} failed", e)
+                false
             }
-            true
-        } catch (e: IOException) {
-            thisLogger().debug("Bind test of $address failed", e)
-            false
         }
     }
 
@@ -120,6 +134,18 @@ object HostProbe {
     } catch (e: UnknownHostException) {
         thisLogger().debug("Lookup of $host failed", e)
         false
+    }
+
+    /**
+     * Every address behind the host, so a dual-stack name is not reduced to whichever family the
+     * resolver happened to put first. Falls back to whatever the eager lookup in [socketAddress]
+     * already produced, which is null only for a name that does not resolve at all.
+     */
+    private fun candidates(target: InetSocketAddress): List<InetAddress> = try {
+        InetAddress.getAllByName(target.hostString).toList()
+    } catch (e: UnknownHostException) {
+        thisLogger().debug("Lookup of ${target.hostString} failed", e)
+        listOfNotNull(target.address)
     }
 
     private fun schemePort(address: String): Int? = when {

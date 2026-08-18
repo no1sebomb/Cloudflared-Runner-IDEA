@@ -39,6 +39,7 @@ import com.noisebomb.cloudflared.service.HostProbe
 import com.noisebomb.cloudflared.service.TunnelService
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.awt.GraphicsEnvironment
 import java.awt.Rectangle
 import java.awt.event.FocusAdapter
 import java.awt.event.FocusEvent
@@ -185,18 +186,40 @@ class ConnectionDialog(
             }
         }
         form.border = JBUI.Borders.empty(8)
-        return JBScrollPane(FormHost(form)).apply {
+        val host = FormHost(form)
+        // Lay the form out once before measuring it. The command preview wraps, so its height is a
+        // function of its width — and until something has laid it out its width is zero, which sends
+        // it to a fallback width that is not the one it ends up with. Measuring the untouched form
+        // therefore reports the height of a wrap that never happens, leaving the viewport short by
+        // however much the real wrap adds and putting a scrollbar on a form that fits.
+        host.setSize(host.preferredSize.width, Short.MAX_VALUE.toInt())
+        host.doLayout()
+        return JBScrollPane(host).apply {
             border = JBUI.Borders.empty()
             viewportBorder = null
             horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
             verticalScrollBar.unitIncrement = JBUI.scale(SCROLL_UNIT)
             // Opens at the form's own size; past this the dialog scrolls instead of running off
             // the bottom of the screen, which is what the expanded advanced group does otherwise.
-            preferredSize = Dimension(
-                preferredSize.width,
-                minOf(preferredSize.height, JBUI.scale(MAX_FORM_HEIGHT)),
-            )
+            // The slack is for the rounding either side of that measurement: a scrollbar that buys
+            // the user a pixel or two of travel is pure cost, so err on the side of not showing one.
+            val natural = preferredSize.height + JBUI.scale(FORM_HEIGHT_SLACK)
+            preferredSize = Dimension(preferredSize.width, minOf(natural, maxFormHeight()))
         }
+    }
+
+    /**
+     * How tall the form may get before it scrolls instead. Measured off the screen rather than
+     * fixed, because the screen is the thing the cap exists to stay inside: a constant generous
+     * enough for a laptop leaves a desktop scrolling a form that had room to open whole, and one
+     * tuned to today's form starts scrolling for a pixel or two the moment a row is added to it.
+     *
+     * The budget is the *usable* screen — [GraphicsEnvironment.getMaximumWindowBounds] already
+     * excludes the taskbar — less room for the dialog's title bar, button row and margins.
+     */
+    private fun maxFormHeight(): Int {
+        val usable = GraphicsEnvironment.getLocalGraphicsEnvironment().maximumWindowBounds.height
+        return (usable * SCREEN_BUDGET).toInt().coerceAtLeast(JBUI.scale(MIN_FORM_HEIGHT))
     }
 
     /**
@@ -610,7 +633,15 @@ class ConnectionDialog(
         const val CLOUDFLARE = "cloudflare"
         const val TYPING_PAUSE_MILLIS = 350
         const val SCROLL_UNIT = 16
-        const val MAX_FORM_HEIGHT = 620
+
+        /** Share of the usable screen height the form may occupy before it starts scrolling. */
+        const val SCREEN_BUDGET = 0.75
+
+        /** Floor for [maxFormHeight], so a very short screen still shows a usable slice of form. */
+        const val MIN_FORM_HEIGHT = 420
+
+        /** Swallows the last pixels of measurement rounding rather than scrolling for them. */
+        const val FORM_HEIGHT_SLACK = 4
         const val BIND_HINT = "localhost:5433"
         const val SERVICE_HINT = "localhost:8080"
         const val HOSTNAME_HINT = "db.example.com"
