@@ -695,6 +695,10 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
             column: Int,
         ) {
             val config = value as? ConnectionConfig ?: return
+            // The tag colour is the row's background, so it has to lose to the selection colour.
+            if (!selected) {
+                ConnectionColors.rowBackground(config.color)?.let { background = it }
+            }
             render(table, config, row)
         }
 

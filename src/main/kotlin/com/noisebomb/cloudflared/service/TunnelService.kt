@@ -27,9 +27,6 @@ import com.noisebomb.cloudflared.model.ConnectionConfig
 import com.noisebomb.cloudflared.model.ConnectionState
 import com.noisebomb.cloudflared.model.ConnectionStatus
 import com.noisebomb.cloudflared.model.ConnectionType
-import java.io.IOException
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -163,7 +160,7 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
         if (isRunning(config)) return
         stopRequested.remove(config.id)
 
-        val commandLine = GeneralCommandLine(config.commandLine(executable))
+        val commandLine = GeneralCommandLine(config.commandLine(config.resolveExecutable(executable)))
             .withCharset(StandardCharsets.UTF_8)
             .withWorkDirectory(project.basePath)
 
@@ -230,7 +227,7 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
      * row leaves "Starting" as soon as the listener is actually up.
      */
     private fun probeAccessListener(config: ConnectionConfig) {
-        if (socketAddress(config.localBind) == null) {
+        if (HostProbe.socketAddress(config.localBind) == null) {
             // Nothing to connect to. Do not leave the row stuck on "Starting" over it.
             schedule(PROBE_SETTLE_MILLIS) { promoteIfStarting(config) }
             return
@@ -263,35 +260,8 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
         if (states[config.id]?.status == ConnectionStatus.STARTING && isRunning(config)) markRunning(config)
     }
 
-    private fun connectToListener(config: ConnectionConfig): Boolean = canConnect(config.localBind)
-
-    /** One connect-and-drop. Failure only ever means "not yet" to the caller. */
-    private fun canConnect(address: String): Boolean {
-        val target = socketAddress(address) ?: return false
-        return try {
-            Socket().use { it.connect(target, PROBE_TIMEOUT_MILLIS) }
-            true
-        } catch (e: IOException) {
-            thisLogger().debug("Probe of $address failed", e)
-            false
-        }
-    }
-
-    /** `tcp://localhost:5432`, `http://localhost:3000` and bare `localhost:8080` all turn up here. */
-    private fun socketAddress(address: String): InetSocketAddress? {
-        val hostPort = address.substringAfter("://", address).trim().trimEnd('/').substringBefore('/')
-        val host = hostPort.substringBeforeLast(':', "").ifBlank { hostPort }
-        val port = hostPort.substringAfterLast(':', "").toIntOrNull()
-            ?: defaultPort(address)
-            ?: return null
-        return if (host.isBlank() || port !in 1..MAX_PORT) null else InetSocketAddress(host, port)
-    }
-
-    private fun defaultPort(address: String): Int? = when {
-        address.startsWith("https://") -> HTTPS_PORT
-        address.startsWith("http://") -> HTTP_PORT
-        else -> null
-    }
+    private fun connectToListener(config: ConnectionConfig): Boolean =
+        HostProbe.canConnect(config.localBind, timeoutMillis = PROBE_TIMEOUT_MILLIS)
 
     /**
      * cloudflared says nothing when a browser login finally succeeds, so the only way to notice is
@@ -344,8 +314,8 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
                 setState(config, ConnectionState(ConnectionStatus.STOPPED))
                 return@schedule
             }
-            val checkable = config.type == ConnectionType.QUICK_TUNNEL && socketAddress(config.target) != null
-            if (!checkable || canConnect(config.target)) {
+            val checkable = config.type == ConnectionType.QUICK_TUNNEL && HostProbe.socketAddress(config.target) != null
+            if (!checkable || HostProbe.canConnect(config.target, timeoutMillis = PROBE_TIMEOUT_MILLIS)) {
                 setWarning(config, "")
                 scheduleHealthCheck(config, failures = 0)
                 return@schedule
@@ -524,10 +494,6 @@ class TunnelService(private val project: Project) : PersistentStateComponent<Tun
         private const val HEALTH_INTERVAL_MILLIS = 2000L
         private const val HEALTH_FAILURES_ALLOWED = 2
         private const val ORIGIN_UNREACHABLE = "local service is down, public URL returns 502"
-
-        private const val MAX_PORT = 65535
-        private const val HTTP_PORT = 80
-        private const val HTTPS_PORT = 443
 
         /** No exit code exists when the process never got off the ground. */
         private const val NOT_STARTED = -1

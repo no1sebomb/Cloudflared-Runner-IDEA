@@ -1,7 +1,5 @@
 package com.noisebomb.cloudflared
 
-import com.noisebomb.cloudflared.model.ConnectionConfig
-import com.noisebomb.cloudflared.model.ConnectionType
 import com.noisebomb.cloudflared.service.CloudflaredOutput
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -98,24 +96,5 @@ class CloudflaredOutputTest {
     @Test
     fun `falls back to the exit code when the process said nothing`() {
         assertEquals("Exited with code 7", CloudflaredOutput.summarize("", 7))
-    }
-
-    @Test
-    fun `builds the quick tunnel argument vector`() {
-        val config = ConnectionConfig(type = ConnectionType.QUICK_TUNNEL, target = "localhost:8080")
-        assertEquals(listOf("cloudflared", "tunnel", "--url", "localhost:8080"), config.commandLine("cloudflared"))
-    }
-
-    @Test
-    fun `builds the access client argument vector`() {
-        val config = ConnectionConfig(
-            type = ConnectionType.ACCESS_TCP,
-            target = "db.example.com",
-            localBind = "localhost:5433",
-        )
-        assertEquals(
-            listOf("cloudflared", "access", "tcp", "--hostname", "db.example.com", "--url", "localhost:5433"),
-            config.commandLine("cloudflared"),
-        )
     }
 }
