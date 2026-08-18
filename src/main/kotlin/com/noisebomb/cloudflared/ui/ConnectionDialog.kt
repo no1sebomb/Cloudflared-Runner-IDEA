@@ -6,6 +6,7 @@ import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
+import com.intellij.openapi.ui.ComponentValidator
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.openapi.ui.ValidationInfo
@@ -14,10 +15,11 @@ import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.JBIntSpinner
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.components.JBCheckBox
-import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextField
+import com.intellij.ui.components.fields.ExtendableTextComponent.Extension
+import com.intellij.ui.components.fields.ExtendableTextField
 import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.BottomGap
 import com.intellij.ui.dsl.builder.Panel
@@ -32,6 +34,7 @@ import com.noisebomb.cloudflared.model.ConnectionType
 import com.noisebomb.cloudflared.model.EdgeIpVersion
 import com.noisebomb.cloudflared.model.LogLevel
 import com.noisebomb.cloudflared.model.TunnelProtocol
+import com.noisebomb.cloudflared.service.CloudflaredBinary
 import com.noisebomb.cloudflared.service.HostProbe
 import com.noisebomb.cloudflared.service.TunnelService
 import java.awt.BorderLayout
@@ -39,7 +42,6 @@ import java.awt.Dimension
 import java.awt.Rectangle
 import java.awt.event.FocusAdapter
 import java.awt.event.FocusEvent
-import javax.swing.Icon
 import javax.swing.JComponent
 import javax.swing.ScrollPaneConstants
 import javax.swing.Scrollable
@@ -71,8 +73,12 @@ class ConnectionDialog(
         (textField as? JBTextField)?.emptyText?.text = TunnelService.getInstance(project).executable
         addBrowseFolderListener(project, FileChooserDescriptorFactory.singleFile())
     }
-    private val targetField = JBTextField(original.target, FIELD_COLUMNS)
-    private val bindField = JBTextField(original.localBind.ifBlank { "localhost:" }, FIELD_COLUMNS)
+    private val targetField = ExtendableTextField(original.target, FIELD_COLUMNS).apply {
+        emptyText.text = if (isQuickTunnel) SERVICE_HINT else HOSTNAME_HINT
+    }
+    private val bindField = ExtendableTextField(original.localBind.ifBlank { "localhost:" }, FIELD_COLUMNS).apply {
+        emptyText.text = BIND_HINT
+    }
     private val accessProtocolCombo = textCombo(AccessProtocol.entries, original.accessProtocol)
 
     // --- advanced, quick tunnel ---
@@ -95,12 +101,23 @@ class ConnectionDialog(
     // --- advanced, shared ---
     private val logLevelCombo = textCombo(LogLevel.entries, original.logLevel)
 
-    /** Result of the last target check; advisory, never blocks OK. */
-    private val reachability = JBLabel()
+    /**
+     * The platform's own field validation — amber or red outline plus its balloon. Everything the
+     * checks report goes through these rather than a hand-rolled tooltip, so a warning here looks
+     * exactly like a warning anywhere else in the IDE.
+     */
+    private val targetStatus = FieldStatus(targetField)
+    private val bindStatus = FieldStatus(bindField)
+    private val executableStatus =
+        FieldStatus(executableField.textField as ExtendableTextField, host = executableField)
+
+    /** Target of the last check; its result is advisory and never blocks OK. */
     private var checkedTarget = ""
 
-    /** Result of the last port check. Unlike the hostname, a taken port does block OK. */
-    private val bindStatus = JBLabel()
+    /** Executable of the last check, already resolved through the project default. */
+    private var checkedExecutable = ""
+
+    /** Bind address of the last check. Unlike the hostname, a taken port does block OK. */
     private var checkedBind = ""
     private var bindPortTaken = false
 
@@ -110,8 +127,10 @@ class ConnectionDialog(
 
     private val commandPreview = CommandPreview()
 
-    /** Debounces [checkBind] so a probe does not run on every keystroke. */
+    /** Debounce [checkBind] and [checkTarget] so a probe does not run on every keystroke. */
     private val bindAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, disposable)
+    private val targetAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, disposable)
+    private val executableAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, disposable)
 
     /** Filled in on OK. */
     var result: ConnectionConfig = original.copyOf()
@@ -124,6 +143,7 @@ class ConnectionDialog(
         installAutoName()
         installPreview()
         installTargetCheck()
+        installExecutableCheck()
         if (!isQuickTunnel) installBindCheck()
         updatePreview()
     }
@@ -143,16 +163,13 @@ class ConnectionDialog(
             group(CONNECTION_TITLE) {
                 if (isQuickTunnel) {
                     row("Local service:") { cell(targetField) }
-                    row("") { cell(reachability) }
                 } else {
                     row("Public hostname:") {
                         cell(targetField)
                         label("Protocol:").gap(RightGap.SMALL)
                         cell(accessProtocolCombo)
                     }
-                    row("") { cell(reachability) }
                     row("Local bind:") { cell(bindField) }
-                    row("") { cell(bindStatus) }
                 }
             }
 
@@ -350,9 +367,17 @@ class ConnectionDialog(
         targetField.addFocusListener(object : FocusAdapter() {
             override fun focusLost(e: FocusEvent) = checkTarget()
         })
+        // Only the quick tunnel probes as you type: its target is a socket on this machine, while an
+        // access hostname costs a DNS lookup and an HTTPS round trip per keystroke.
+        if (isQuickTunnel) {
+            targetField.onChange {
+                targetAlarm.cancelAllRequests()
+                targetAlarm.addRequest({ checkTarget() }, TYPING_PAUSE_MILLIS)
+            }
+        }
         when {
             targetField.text.isNotBlank() -> checkTarget()
-            isQuickTunnel -> show(reachability, null, SERVICE_HINT)
+            isQuickTunnel -> targetStatus.clear()
         }
     }
 
@@ -370,10 +395,10 @@ class ConnectionDialog(
         if (target == checkedTarget) return
         checkedTarget = target
         if (target.isBlank() || HostProbe.socketAddress(target) == null) {
-            show(reachability, null, SERVICE_HINT)
+            targetStatus.clear()
             return
         }
-        show(reachability, null, "Checking $target…")
+        targetStatus.clear()
         val httpExpected = original.copyOf().apply { this.target = target }.isHttpTarget()
         ApplicationManager.getApplication().executeOnPooledThread {
             val reachable = HostProbe.canConnect(target)
@@ -381,19 +406,17 @@ class ConnectionDialog(
             onEdt {
                 if (target != checkedTarget) return@onEdt
                 when {
-                    !reachable -> show(
-                        reachability,
-                        AllIcons.General.Warning,
+                    !reachable -> targetStatus.problem(
                         "Nothing is listening on $target — the tunnel will answer 502",
+                        warning = true,
                     )
 
-                    !speaksHttp -> show(
-                        reachability,
-                        AllIcons.General.Warning,
+                    !speaksHttp -> targetStatus.problem(
                         "$target answered, but not over HTTP — the public URL only serves HTTP",
+                        warning = true,
                     )
 
-                    else -> show(reachability, AllIcons.General.InspectionsOK, "$target is reachable")
+                    else -> targetStatus.ok("$target is reachable")
                 }
             }
         }
@@ -413,22 +436,67 @@ class ConnectionDialog(
         if (host == checkedTarget) return
         checkedTarget = host
         if (host.isBlank()) {
-            show(reachability, null, "")
+            targetStatus.clear()
             return
         }
-        show(reachability, null, "Checking $host…")
+        targetStatus.clear()
         ApplicationManager.getApplication().executeOnPooledThread {
             val resolved = HostProbe.resolves(host)
             val server = if (resolved) HostProbe.serverHeader(host) else null
             onEdt {
                 if (host != checkedTarget) return@onEdt
                 when {
-                    !resolved -> show(reachability, AllIcons.General.Error, "$host could not be resolved")
+                    !resolved -> targetStatus.problem("$host could not be resolved", warning = false)
                     server == null ->
-                        show(reachability, AllIcons.General.Warning, "$host did not answer over HTTPS")
+                        targetStatus.problem("$host did not answer over HTTPS", warning = true)
                     !server.contains(CLOUDFLARE) ->
-                        show(reachability, AllIcons.General.Warning, "$host is served by \"$server\", not Cloudflare")
-                    else -> show(reachability, AllIcons.General.InspectionsOK, "$host is accessible")
+                        targetStatus.problem("$host is served by \"$server\", not Cloudflare", warning = true)
+                    else -> targetStatus.ok("$host is accessible")
+                }
+            }
+        }
+    }
+
+    /**
+     * Asks the executable what it is, rather than finding out at Run time. An empty field is checked
+     * too — it resolves to the project's `cloudflared`, and "not on PATH" is exactly the answer worth
+     * having before the connection is saved.
+     *
+     * Advisory in every case: PATH inside the IDE is not always PATH at spawn time, and refusing to
+     * save a connection over a disagreement about that would be worse than letting it fail loudly.
+     */
+    private fun installExecutableCheck() {
+        val field = executableField.textField
+        field.addFocusListener(object : FocusAdapter() {
+            override fun focusLost(e: FocusEvent) = checkExecutable()
+        })
+        field.onChange {
+            executableAlarm.cancelAllRequests()
+            executableAlarm.addRequest({ checkExecutable() }, TYPING_PAUSE_MILLIS)
+        }
+        checkExecutable()
+    }
+
+    private fun checkExecutable() {
+        val typed = executableField.text.trim()
+        val resolved = typed.ifBlank { TunnelService.getInstance(project).executable }
+        if (resolved == checkedExecutable) return
+        checkedExecutable = resolved
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = CloudflaredBinary.probe(resolved)
+            onEdt {
+                if (resolved != checkedExecutable) return@onEdt
+                when (result) {
+                    is CloudflaredBinary.Result.Ok -> executableStatus.ok(result.version)
+                    is CloudflaredBinary.Result.Unexpected -> executableStatus.problem(
+                        "$resolved does not look like cloudflared — ${result.description}",
+                        warning = true,
+                    )
+
+                    CloudflaredBinary.Result.Missing -> executableStatus.problem(
+                        if (typed.isBlank()) "$resolved was not found on PATH" else "$resolved could not be run",
+                        warning = false,
+                    )
                 }
             }
         }
@@ -459,7 +527,7 @@ class ConnectionDialog(
         bindPortTaken = false
         val port = HostProbe.socketAddress(bind)?.port
         if (bind.isBlank() || port == null) {
-            show(bindStatus, null, BIND_HINT)
+            bindStatus.clear()
             return
         }
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -467,11 +535,9 @@ class ConnectionDialog(
             onEdt {
                 if (bind != checkedBind) return@onEdt
                 bindPortTaken = !available
-                if (available) {
-                    show(bindStatus, AllIcons.General.InspectionsOK, "Port :$port is available")
-                } else {
-                    show(bindStatus, AllIcons.General.Error, "Port :$port is already allocated")
-                }
+                // A taken port already comes back from doValidate, which outlines the field and
+                // disables Save; decorating it here as well would put two balloons on one field.
+                if (available) bindStatus.ok("Port :$port is available") else bindStatus.clear()
                 // Re-run validation, so the OK button agrees with what the label now says.
                 initValidation()
             }
@@ -485,10 +551,33 @@ class ConnectionDialog(
         }, ModalityState.any())
     }
 
-    private fun show(label: JBLabel, icon: Icon?, text: String) {
-        label.icon = icon
-        label.text = text
-        label.foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
+    /**
+     * One field's verdict. `ComponentValidator` supplies the outline and the message balloon but
+     * never an icon, so the icon inside the field is added alongside it — and without a tooltip,
+     * since the balloon already carries the text.
+     */
+    private inner class FieldStatus(private val field: ExtendableTextField, host: JComponent = field) {
+        private val validator = ComponentValidator(disposable)
+            // A browse button is a composite; the outline belongs around the whole control.
+            .apply { if (host !== field) withOutlineProvider(ComponentValidator.CWBB_PROVIDER) }
+            .installOn(host)
+
+        /** Success has no platform state, so the green check is ours and carries its own tooltip. */
+        fun ok(message: String) {
+            validator.updateInfo(null)
+            field.setExtensions(Extension.create(AllIcons.General.InspectionsOK, message, null))
+        }
+
+        fun problem(message: String, warning: Boolean) {
+            val icon = if (warning) AllIcons.General.BalloonWarning else AllIcons.General.BalloonError
+            field.setExtensions(Extension.create(icon, null, null))
+            validator.updateInfo(ValidationInfo(message, field).let { if (warning) it.asWarning() else it })
+        }
+
+        fun clear() {
+            field.setExtensions(emptyList())
+            validator.updateInfo(null)
+        }
     }
 
     // --- component helpers --------------------------------------------------------------------
@@ -522,8 +611,9 @@ class ConnectionDialog(
         const val TYPING_PAUSE_MILLIS = 350
         const val SCROLL_UNIT = 16
         const val MAX_FORM_HEIGHT = 620
-        const val BIND_HINT = "The address cloudflared listens on here, e.g. localhost:5433"
-        const val SERVICE_HINT = "The service on this machine to expose, e.g. localhost:8080"
+        const val BIND_HINT = "localhost:5433"
+        const val SERVICE_HINT = "localhost:8080"
+        const val HOSTNAME_HINT = "db.example.com"
         const val GENERAL_TITLE = "General"
         const val CONNECTION_TITLE = "Connection"
         const val COMMAND_TITLE = "Startup Command"
