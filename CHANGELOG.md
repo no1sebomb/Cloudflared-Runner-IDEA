@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-18
+
 ### Added
 
 - Tool window listing `cloudflared` connections, with per-row start/stop.
@@ -18,3 +20,6 @@
 - Per-connection `Executable` override for a `cloudflared` that is not on `PATH`.
 - Optional row colour for telling a long list apart.
 - Connections persisted per project; running processes killed when the project closes.
+
+[Unreleased]: https://github.com/no1sebomb/Cloudflared-Runner-IDEA/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/no1sebomb/Cloudflared-Runner-IDEA/commits/v1.0.0

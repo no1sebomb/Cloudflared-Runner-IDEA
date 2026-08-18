@@ -19,7 +19,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.MessageDialogBuilder
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.Disposer
-import com.intellij.openapi.util.IconLoader
 import com.intellij.ui.AnimatedIcon
 import com.intellij.ui.ClientProperty
 import com.intellij.ui.ColoredTableCellRenderer
@@ -29,9 +28,9 @@ import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.TitledSeparator
 import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.icons.RgbImageFilterSupplier
 import com.intellij.ui.render.RenderingUtil
 import com.intellij.ui.table.TableView
+import com.intellij.util.IconUtil
 import com.intellij.util.ui.ColumnInfo
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.ListTableModel
@@ -52,6 +51,7 @@ import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.image.RGBImageFilter
+import java.util.function.Supplier
 import javax.swing.Icon
 import javax.swing.JPanel
 import javax.swing.JTable
@@ -637,16 +637,22 @@ class TunnelPanel(private val project: Project) : JPanel(BorderLayout()), Dispos
         if (!isRowSelected(table, row)) return base
         val foreground = RenderingUtil.getForeground(table, true)
         return selectedIcons.getOrPut(base to foreground) {
-            IconLoader.filterIcon(base, RecolorFilter(foreground))
+            IconUtil.filterIcon(base, RecolorFilter(foreground), table)
         }
     }
 
     private fun isRowSelected(table: JTable, row: Int): Boolean = row in 0 until table.rowCount &&
         table.isRowSelected(row)
 
-    /** Keeps each pixel's alpha — that is the anti-aliasing — and replaces the colour outright. */
-    private class RecolorFilter(private val color: Color) : RgbImageFilterSupplier {
-        override fun getFilter(): RGBImageFilter = object : RGBImageFilter() {
+    /**
+     * Keeps each pixel's alpha — that is the anti-aliasing — and replaces the colour outright.
+     *
+     * A plain [java.util.function.Supplier] rather than the platform's `RgbImageFilterSupplier`:
+     * that interface and `IconLoader.filterIcon` are both `@ApiStatus.Internal`, and the Plugin
+     * Verifier fails the build over them. `IconUtil.filterIcon` is the public equivalent.
+     */
+    private class RecolorFilter(private val color: Color) : Supplier<RGBImageFilter> {
+        override fun get(): RGBImageFilter = object : RGBImageFilter() {
             private val replacement = color.rgb and RGB_MASK
 
             init {
